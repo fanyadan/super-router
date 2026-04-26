@@ -324,6 +324,8 @@ DEFAULT_PRO_EXECUTION_TIMEOUT = 45
 DEFAULT_FLASH_EXECUTION_TIMEOUT = 30
 DEFAULT_PRO_FINALIZER_TIMEOUT = 600
 DEFAULT_FLASH_FINALIZER_TIMEOUT = 600
+DEFAULT_PRO_MODEL = "google-gemini-cli/gemini-3-pro-preview"
+DEFAULT_FLASH_MODEL = "google-gemini-cli/flash"
 GEMINI_PREFLIGHT_RESULTS: Dict[str, str] = {}
 GEMINI_NETWORK_PREFLIGHT_RESULT: str | None = None
 
@@ -517,6 +519,17 @@ def resolve_optional_positive_int(explicit_value: int | None, env_name: str) -> 
     except ValueError:
         return None
     return max(1, parsed)
+
+
+def resolve_bool(env_name: str, fallback: bool = False) -> bool:
+    env_value = os.environ.get(env_name, "").strip().lower()
+    if not env_value:
+        return fallback
+    return env_value in {"1", "true", "yes", "on", "debug"}
+
+
+def router_debug_enabled() -> bool:
+    return resolve_bool("ROUTER_DEBUG")
 
 
 def resolve_model_list(explicit_values: List[str] | None, env_name: str) -> List[str]:
@@ -1147,17 +1160,17 @@ def ollama_generate(
     except TimeoutError as exc:
         raise RuntimeError(f"Ollama timed out after {timeout}s") from exc
 
-    # DEBUG: Log full Ollama response metadata to diagnose token/response issues
-    print(f"\n[DEBUG ollama_generate] Model: {model}, Timeout: {timeout}s, num_predict: {num_predict}")
-    print(f"  Raw data keys: {list(data.keys())}")
-    print(f"  'response' field length: {len(str(data.get('response', '')))} chars")
-    print(f"  'response' first 500 chars: {str(data.get('response', ''))[:500]}")
-    if len(str(data.get('response', ''))) > 500:
-        print(f"  'response' last 200 chars: {str(data.get('response', ''))[-200:]}")
-    print(f"  Metadata: eval_count={data.get('eval_count')}, prompt_eval_count={data.get('prompt_eval_count')}")
-    print(f"  done={data.get('done')}, done_reason={data.get('done_reason')}")
-    print(f"  Text after strip: {len(str(data.get('response', '')).strip())} chars")
-    print(f"  ---\n")
+    if router_debug_enabled():
+        print(f"\n[DEBUG ollama_generate] Model: {model}, Timeout: {timeout}s, num_predict: {num_predict}")
+        print(f"  Raw data keys: {list(data.keys())}")
+        print(f"  'response' field length: {len(str(data.get('response', '')))} chars")
+        print(f"  'response' first 500 chars: {str(data.get('response', ''))[:500]}")
+        if len(str(data.get('response', ''))) > 500:
+            print(f"  'response' last 200 chars: {str(data.get('response', ''))[-200:]}")
+        print(f"  Metadata: eval_count={data.get('eval_count')}, prompt_eval_count={data.get('prompt_eval_count')}")
+        print(f"  done={data.get('done')}, done_reason={data.get('done_reason')}")
+        print(f"  Text after strip: {len(str(data.get('response', '')).strip())} chars")
+        print(f"  ---\n")
     
     text = str(data.get("response", "")).strip()
     if not text:
@@ -1277,7 +1290,7 @@ def generate_text(
     temperature: float = 0.0,
 ) -> str:
     if is_gemini_model(model):
-        return gemini_generate(model, prompt, timeout=max(timeout, 120))
+        return gemini_generate(model, prompt, timeout=timeout)
     return ollama_generate(
         model,
         prompt,
@@ -1753,15 +1766,15 @@ def score_subtask_with_model(task: str, subtask_desc: str, judge_model: str) -> 
         timeout=judge_timeout,
         num_predict=204800,  # Increased for full JSON object output from large models
     )
-    # DEBUG: Log raw judge output to diagnose JSON parsing failures
-    print(f"\n[DEBUG Judge Output for: {subtask_desc[:60]}...]")
-    print(f"  Model: {judge_model}")
-    print(f"  Raw text length: {len(raw_text)} chars")
-    print(f"  First 400 chars: {raw_text[:400]}")
-    if len(raw_text) > 400:
-        print(f"  Last 200 chars: {raw_text[-200:]}")
-    print(f"  Contains '{{': { '{' in raw_text }, Contains '}}': {'}' in raw_text }")
-    print(f"  ---\n")
+    if router_debug_enabled():
+        print(f"\n[DEBUG Judge Output for: {subtask_desc[:60]}...]")
+        print(f"  Model: {judge_model}")
+        print(f"  Raw text length: {len(raw_text)} chars")
+        print(f"  First 400 chars: {raw_text[:400]}")
+        if len(raw_text) > 400:
+            print(f"  Last 200 chars: {raw_text[-200:]}")
+        print(f"  Contains '{{': { '{' in raw_text }, Contains '}}': {'}' in raw_text }")
+        print(f"  ---\n")
     return normalize_complexity_assessment(extract_first_json_object(raw_text), task, subtask_desc)
 
 
@@ -1846,14 +1859,15 @@ def route_after_planner_invoke(state: RouterState) -> str:
 
 def planner_parse_node(state: RouterState) -> Dict[str, Any]:
     raw_text = state["planner_raw_text"]
-    print(f"\n[DEBUG Planner Output]")
-    print(f"  Model: {state['planner_model']}")
-    print(f"  Raw text length: {len(raw_text)} chars")
-    print(f"  First 400 chars: {raw_text[:400]}")
-    if len(raw_text) > 400:
-        print(f"  Last 200 chars: {raw_text[-200:]}")
-    print(f"  Contains '[': { '[' in raw_text }, Contains ']': {']' in raw_text }")
-    print(f"  ---\n")
+    if router_debug_enabled():
+        print(f"\n[DEBUG Planner Output]")
+        print(f"  Model: {state['planner_model']}")
+        print(f"  Raw text length: {len(raw_text)} chars")
+        print(f"  First 400 chars: {raw_text[:400]}")
+        if len(raw_text) > 400:
+            print(f"  Last 200 chars: {raw_text[-200:]}")
+        print(f"  Contains '[': { '[' in raw_text }, Contains ']': {']' in raw_text }")
+        print(f"  ---\n")
     try:
         planned_subtasks = normalize_planned_subtasks(extract_first_json_array(raw_text))
         planned_subtasks = ensure_communication_subtask(state["task"], planned_subtasks)
@@ -2462,7 +2476,11 @@ def flash_finalizer_node(state: RouterState) -> Dict[str, Any]:
         state["flash_model"],
         state["flash_fallback_models"],
         build_finalizer_prompt(state, FLASH),
-        timeout=DEFAULT_FLASH_FINALIZER_TIMEOUT,
+        timeout=resolve_positive_int(
+            None,
+            "ROUTER_FINALIZER_TIMEOUT",
+            DEFAULT_FLASH_FINALIZER_TIMEOUT,
+        ),
         num_predict=320,
         temperature=0.0,
         label="Finalizer FLASH",
@@ -2555,15 +2573,29 @@ def route_after_flash_finalizer_verify(state: RouterState) -> str:
 
 
 def extract_technical_metadata_node(state: RouterState) -> Dict[str, Any]:
-    print(f"\n[Node: Metadata Extractor] 🔍 Extracting technical gold from Step {state['current_step']}")
-    
-    active_output = state.get("active_output", "")
-    if not active_output or "failed" in state.get("status", ""):
-        return {"history": [f"Step {state['current_step']} metadata extraction skipped (no output or failure)."]}
+    results = state.get("results", [])
+    if not results:
+        print("\n[Node: Metadata Extractor] 🔍 No recorded step available for metadata extraction.")
+        return {"history": ["Metadata extraction skipped because no step result was recorded."]}
+
+    latest_result = results[-1]
+    step_number = latest_result["step"]
+    step_status = latest_result["status"]
+    active_output = latest_result["output"].strip()
+
+    print(f"\n[Node: Metadata Extractor] 🔍 Extracting technical gold from Step {step_number}")
+
+    if (
+        not active_output
+        or "failed" in step_status
+        or step_status == "executor_fallback"
+        or "exhausted" in step_status
+    ):
+        return {"history": [f"Step {step_number} metadata extraction skipped (no output or failure)."]}
 
     prompt = (
         f"Task: {state['task']}\n"
-        f"Subtask: {state['active_subtask'].get('desc', 'Unknown')}\n"
+        f"Subtask: {latest_result['desc']}\n"
         f"Output: {active_output}\n\n"
         "Instruction: Extract the 'technical gold' from this output. "
         "Identify: 1. Key architectural decisions, 2. Specific library/tool choices, 3. Critical logic/algorithm details, "
@@ -2587,7 +2619,7 @@ def extract_technical_metadata_node(state: RouterState) -> Dict[str, Any]:
     
     # We append this to history with a clear marker so the Finalizer can find it.
     return {
-        "history": [f"--- TECHNICAL METADATA STEP {state['current_step']} ---\n{metadata}\n---"]
+        "history": [f"--- TECHNICAL METADATA STEP {step_number} ---\n{metadata}\n---"]
     }
 
 
@@ -2598,7 +2630,11 @@ def pro_finalizer_node(state: RouterState) -> Dict[str, Any]:
         state["pro_model"],
         state["pro_fallback_models"],
         build_finalizer_prompt(state, PRO),
-        timeout=DEFAULT_PRO_FINALIZER_TIMEOUT,
+        timeout=resolve_positive_int(
+            None,
+            "ROUTER_FINALIZER_TIMEOUT",
+            DEFAULT_PRO_FINALIZER_TIMEOUT,
+        ),
         num_predict=420,
         temperature=0.0,
         label="Finalizer PRO",
@@ -2883,8 +2919,8 @@ def create_initial_state(
 ) -> RouterState:
     resolved_planner = resolve_model(planner_model, "ROUTER_PLANNER_MODEL", "gemma4:26b")
     resolved_judge = resolve_model(judge_model, "ROUTER_JUDGE_MODEL", "llama3.1:8b")
-    resolved_pro = resolve_execution_model(pro_model, "ROUTER_PRO_MODEL", "google-gemini-cli/gemini-3-pro-preview")
-    resolved_flash = resolve_execution_model(flash_model, "ROUTER_FLASH_MODEL", "google-gemini-cli/gemini-3-pro-preview")
+    resolved_pro = resolve_execution_model(pro_model, "ROUTER_PRO_MODEL", DEFAULT_PRO_MODEL)
+    resolved_flash = resolve_execution_model(flash_model, "ROUTER_FLASH_MODEL", DEFAULT_FLASH_MODEL)
     resolved_pro_fallback_models = resolve_model_list(
         pro_fallback_models,
         "ROUTER_PRO_FALLBACK_MODELS",

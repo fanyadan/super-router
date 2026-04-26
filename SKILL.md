@@ -126,12 +126,18 @@ process(action="wait", session_id="<session_id_from_exec>", timeout=300)
 | `ROUTER_PLANNER_MODEL` | Task decomposition model | `gemma4:26b` |
 | `ROUTER_JUDGE_MODEL` | Complexity scoring model | `llama3.1:8b` |
 | `ROUTER_PRO_MODEL` | Heavy reasoning executor | `google-gemini-cli/gemini-3-pro-preview` |
-| `ROUTER_FLASH_MODEL` | Fast executor | `google-gemini-cli/gemini-3-pro-preview` |
+| `ROUTER_FLASH_MODEL` | Fast executor | `google-gemini-cli/flash` |
 | `ROUTER_PRO_FALLBACK_MODELS` | Comma-separated PRO fallback list | None |
 | `ROUTER_FLASH_FALLBACK_MODELS` | Comma-separated FLASH fallback list | None |
 | `ROUTER_FLASH_RETRY_BUDGET` | Max FLASH retries before escalation | 1 |
 | `ROUTER_RECURSION_LIMIT` | Python recursion limit | 128 |
-| `ROUTER_JUDGE_TIMEOUT` | Timeout for Judge node LLM calls (seconds) | 300 (5 min for large models) |\n| `ROUTER_MAX_CONCURRENCY` | LangGraph max node concurrency; set `1` for local 26B+ Judge models | Auto (`1` for large Judge models) |\n| `ROUTER_GEMINI_CLI` | Path to Gemini CLI (if using instead of Ollama) | `/opt/homebrew/bin/gemini` |\n| `ROUTER_GEMINI_EXTENSION` | Gemini CLI extension name used with `-e`; `superpowers` is the Gemini extension | `superpowers` |\n| `ROUTER_OLLAMA_URL` | Ollama API endpoint | `http://localhost:11434/api/generate` |\n| `ROUTER_FINALIZER_TIMEOUT` | Timeout for the final reporting synthesis (seconds). Essential to set high (e.g., 600) for complex tasks to avoid timeouts during context assembly. | 600 |
+| `ROUTER_JUDGE_TIMEOUT` | Timeout for Judge node LLM calls (seconds) | 300 (5 min for large models) |
+| `ROUTER_MAX_CONCURRENCY` | LangGraph max node concurrency; set `1` for local 26B+ Judge models | Auto (`1` for large Judge models) |
+| `ROUTER_GEMINI_CLI` | Path to Gemini CLI (if using instead of Ollama) | `/opt/homebrew/bin/gemini` |
+| `ROUTER_GEMINI_EXTENSION` | Gemini CLI extension name used with `-e`; `superpowers` is the Gemini extension | `superpowers` |
+| `ROUTER_OLLAMA_URL` | Ollama API endpoint | `http://localhost:11434/api/generate` |
+| `ROUTER_FINALIZER_TIMEOUT` | Timeout for the final reporting synthesis (seconds). Essential to set high (e.g., 600) for complex tasks to avoid timeouts during context assembly. | 600 |
+| `ROUTER_DEBUG` | Print raw planner/judge/Ollama diagnostic snippets | Off |
 
 **For large models (20B+ like gemma4:26b):**
 - Prefer `ROUTER_PLANNER_MODEL=gemma4:26b` with `ROUTER_JUDGE_MODEL=llama3.1:8b`
