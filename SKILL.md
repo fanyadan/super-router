@@ -131,7 +131,7 @@ process(action="wait", session_id="<session_id_from_exec>", timeout=300)
 | `ROUTER_FLASH_FALLBACK_MODELS` | Comma-separated FLASH fallback list | None |
 | `ROUTER_FLASH_RETRY_BUDGET` | Max FLASH retries before escalation | 1 |
 | `ROUTER_RECURSION_LIMIT` | Python recursion limit | 128 |
-| `ROUTER_JUDGE_TIMEOUT` | Timeout for Judge node LLM calls (seconds) | 300 (5 min for large models) |
+| `ROUTER_JUDGE_TIMEOUT` | Timeout for Judge node LLM calls (seconds) | 300 (up to 6000 for extremely complex tasks with large models) |
 | `ROUTER_MAX_CONCURRENCY` | LangGraph max node concurrency; set `1` for local 26B+ Judge models | Auto (`1` for large Judge models) |
 | `ROUTER_GEMINI_CLI` | Path to Gemini CLI (if using instead of Ollama) | `/opt/homebrew/bin/gemini` |
 | `ROUTER_GEMINI_EXTENSION` | Gemini CLI extension name used with `-e`; `superpowers` is the Gemini extension | `superpowers` |
