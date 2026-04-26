@@ -207,7 +207,8 @@ FLASH finalizer → (if fails) → PRO finalizer → (if fails) → Deterministi
 
 ## Output Structure
 
-The router returns a JSON-serializable state with:
+- **Output Structure**: The router returns a JSON-serializable state. When summarizing these results in reports or documentation, always use ASCII/Terminal-style arrows (e.g., '-->', '->') rather than mathematical arrows (e.g., '→', '$\rightarrow$') for all diagrams and flow representations. This is a high-priority stylistic requirement.
+
 
 ```json
 {
