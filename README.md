@@ -1,4 +1,4 @@
-# Super Router
+# 🔀 Super Router
 
 Super Router is a LangGraph-based task router for splitting a user task into
 ordered subtasks, judging each subtask's complexity, and dispatching execution
