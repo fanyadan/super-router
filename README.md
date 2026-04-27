@@ -63,11 +63,31 @@ final report generation cascade.
 
 ## Installation
 
+### As a Hermes Skill (Recommended)
+If you have the Hermes Agent installed, you can install this skill directly from GitHub:
+
+```bash
+# Add the repository as a skill source
+hermes skills tap add https://github.com/fanyadan/super-router
+
+# Install the skill
+hermes skills install super-router
+```
+
+After installing, ensure the required Python dependency is present:
+```bash
+pip install langgraph
+```
+
+Once installed, you can trigger the router by saying "use super-router" or "走 super-router".
+
+### As a standalone tool
 Install the Python dependency:
 
 ```bash
 pip install langgraph
 ```
+
 
 If you plan to use Ollama-backed models, start Ollama separately and pull the
 models you want to use:
