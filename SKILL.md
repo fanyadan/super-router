@@ -81,9 +81,18 @@ export ROUTER_MAX_CONCURRENCY=1
 
 When user says "走 super-router", "use super-router", or asks for router analysis:
 
+**CRITICAL:** The `terminal()` tool does NOT source `.zshrc` or `.bashrc`. You MUST explicitly pass `ROUTER_*` variables via the `env` parameter to ensure user preferences (like `ROUTER_JUDGE_MODEL=gemma4:26b`) are respected.
+
 ```python
-# Direct execution with task as argument
-terminal(command="/opt/homebrew/Caskroom/miniforge/base/bin/python ~/.hermes/skills/mlops/inference/super-router/scripts/router.py '分析 K8s YAML 错误并重写配置'")
+# CORRECT PATTERN: Explicitly pass env vars to avoid internal defaults
+terminal(
+    command="/opt/homebrew/Caskroom/miniforge/base/bin/python ~/.hermes/skills/mlops/inference/super-router/scripts/router.py '分析 K8s YAML 错误并重写配置'",
+    env={
+        "ROUTER_PLANNER_MODEL": "google-gemini-cli/gemini-3-pro-preview",
+        "ROUTER_JUDGE_MODEL": "gemma4:26b",
+        "ROUTER_JUDGE_TIMEOUT": "600"
+    }
+)
 ```
 
 ### With Streaming (Node-Level Progress)
@@ -187,28 +196,27 @@ When FLASH execution fails or produces questionable output:
    - `capability_quality`: "need more info", empty output, too short, repeated task
 
 2. **Decision:**
-   - Infra failure → Retry FLASH (up to `ROUTER_FLASH_RETRY_BUDGET`)
-   - Capability failure → Escalate to PRO immediately
-   - Unknown → Retry once, then escalate
+   - Infra failure -> Retry FLASH (up to `ROUTER_FLASH_RETRY_BUDGET`)
+   - Capability failure -> Escalate to PRO immediately
+   - Unknown -> Retry once, then escalate
 
 3. **Post-execution verification:**
-   - Empty output → escalate
-   - Output < 48 chars (non-summary) → escalate
-   - Output explicitly says "can't complete" → escalate
-   - Output just repeats task description → escalate
+   - Empty output -> escalate
+   - Output < 48 chars (non-summary) -> escalate
+   - Output explicitly says "can't complete" -> escalate
+   - Output just repeats task description -> escalate
 
 ## Finalizer Fallback Chain
 
 Final report generation follows:
 
 ```
-FLASH finalizer → (if fails) → PRO finalizer → (if fails) → Deterministic template
+FLASH finalizer -> (if fails) -> PRO finalizer -> (if fails) -> Deterministic template
 ```
 
 ## Output Structure
 
-- **Output Structure**: The router returns a JSON-serializable state. When summarizing these results in reports or documentation, always use ASCII/Terminal-style arrows (e.g., '-->', '->') rather than mathematical arrows (e.g., '→', '$\rightarrow$') for all diagrams and flow representations. This is a high-priority stylistic requirement.
-
+- **Output Structure**: The router returns a JSON-serializable state. When summarizing these results in reports or documentation, always use ASCII/Terminal-style arrows (e.g., '-->', '->') rather than mathematical arrows (e.g., '→', '$\\rightarrow$') for all diagrams and flow representations. This is a high-priority stylistic requirement.
 
 ```json
 {
@@ -261,42 +269,6 @@ FLASH finalizer → (if fails) → PRO finalizer → (if fails) → Deterministi
   }
 }
 ```
-
-## Example Workflows
-
-### Example 1: K8s Incident Triage
-
-```bash
-router.py "生产环境 K8s Pod 频繁重启，分析日志找出根因，给出修复方案并整理给值班同事的简短行动摘要"
-```
-
-**Expected routing:**
-1. "分析 Pod 重启日志，定位错误模式" → PRO (high-risk diagnosis)
-2. "确定根因（资源不足/配置错误/依赖故障）" → PRO (high-risk decision)
-3. "制定修复方案（YAML 调整/回滚/扩容）" → PRO (high-risk repair plan)
-4. "整理给值班同事的简短行动摘要" → FLASH (communication/summary)
-
-### Example 2: Code Refactoring
-
-```bash
-router.py "Refactor auth module to use JWT, add unit tests, update docs"
-```
-
-**Expected routing:**
-1. "Analyze current auth implementation" → PRO (deep inspection)
-2. "Design JWT token structure and claims" → PRO (design logic)
-3. "Implement JWT encoding/decoding" → PRO (implementation)
-4. "Add unit tests for JWT functions" → PRO (test logic)
-5. "Update README with JWT usage examples" → FLASH (documentation)
-
-### Example 3: Simple Summary
-
-```bash
-router.py "Summarize the last 10 git commits"
-```
-
-**Expected routing:**
-- Single subtask → FLASH (summary-like, low complexity)
 
 ## Maintenance
 
