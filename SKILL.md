@@ -26,11 +26,18 @@ Use super-router when you need:
 
 **Not needed for:** Simple single-turn tasks, tasks where you already know which model to use, or when you want manual control over every routing decision.
 
+## Optimization for Parallelism
+To achieve true parallel execution (when `ROUTER_MAX_CONCURRENCY > 1`), the Planner must be instructed to use **Atomic Decomposition**. 
+
+- **Atomic Decomposition**: Breaking a task into the smallest possible independent units (e.g., 10 separate research tasks for 10 companies) rather than "phases" (e.g., one giant 'Research' phase encompassing all companies).
+- **Benefit**: This prevents 'lost-in-the-middle' failures and allows the Dispatcher to fire multiple requests simultaneously, significantly reducing wall-clock time.
+- **Implementation**: When prompting the router for multi-entity tasks, explicitly demand: *"Decompose this into exactly X independent subtasks—one subtask per entity. Do not group them into a single phase."*
+
 ## Core Architecture (LangGraph StateGraph)
 
 | Node | Function |
 |------|----------|
-| **Planner** | Receives original task, calls local Ollama planner model to generate ordered subtask array |
+| **Planner** | Decomposes original task into a JSON array of atomic, actionable subtasks. Uses Atomic Decomposition to split multi-entity tasks (e.g., 10 providers $\rightarrow$ 10 subtasks) for maximum parallelism. |
 | **Judge** | Scores each subtask on 5 dimensions: `reasoning_depth`, `code_change_scope`, `ambiguity`, `risk`, `io_heaviness`; combines with thresholds + confidence to decide PRO/FLASH |
 | **Dispatcher** | Reads `RouterState.current_step`, routes via conditional edge to pro_executor or flash_executor |
 | **PRO Executor** | Heavy reasoning model (default: Gemini CLI preview model; override via `ROUTER_PRO_MODEL`) |
@@ -141,7 +148,7 @@ process(action="wait", session_id="<session_id_from_exec>", timeout=300)
 | `ROUTER_FLASH_RETRY_BUDGET` | Max FLASH retries before escalation | 1 |
 | `ROUTER_RECURSION_LIMIT` | Python recursion limit | 128 |
 | `ROUTER_JUDGE_TIMEOUT` | Timeout for Judge node LLM calls (seconds) | 300 (up to 6000 for extremely complex tasks with large models) |
-| `ROUTER_MAX_CONCURRENCY` | LangGraph max node concurrency; set `1` for local 26B+ Judge models | Auto (`1` for large Judge models) |
+| `ROUTER_MAX_CONCURRENCY` | Max concurrent subtasks executed by the Dispatcher. Essential for multi-entity atomic tasks; set to `1` for local 26B+ Judge models. | Auto (`1` for large Judge models) |
 | `ROUTER_GEMINI_CLI` | Path to Gemini CLI (if using instead of Ollama) | `/opt/homebrew/bin/gemini` |
 | `ROUTER_GEMINI_EXTENSION` | Gemini CLI extension name used with `-e`; `superpowers` is the Gemini extension | `superpowers` |
 | `ROUTER_OLLAMA_URL` | Ollama API endpoint | `http://localhost:11434/api/generate` |

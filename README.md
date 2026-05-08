@@ -13,7 +13,7 @@ final report generation cascade.
 
 ## What It Does
 
-- Decomposes a user task into 2-6 ordered subtasks with a planner model.
+- Decomposes a user task into atomic, actionable subtasks. Uses **Atomic Decomposition** to split multi-entity tasks into individual subtasks for maximum parallelism.*
 - Scores each subtask across reasoning depth, code change scope, ambiguity,
   risk, and IO heaviness.
 - Routes each subtask to PRO or FLASH based on structured scores, confidence,
@@ -429,7 +429,7 @@ straight to the deterministic finalizer.
 | `ROUTER_FLASH_FALLBACK_MODELS` | unset | Comma-separated provider fallback list for FLASH. |
 | `ROUTER_FLASH_RETRY_BUDGET` | `1` | Number of FLASH retries for transient or unknown failures before recording failure. |
 | `ROUTER_RECURSION_LIMIT` | `128` | LangGraph recursion limit for the main router graph. |
-| `ROUTER_MAX_CONCURRENCY` | auto | LangGraph max concurrency. Defaults to `1` for large judge models and otherwise leaves LangGraph default behavior. |
+| `ROUTER_MAX_CONCURRENCY` | `auto` | Max concurrent subtasks executed by the Dispatcher. Essential for multi-entity atomic tasks; set to `1` for local 26B+ Judge models. |
 | `ROUTER_JUDGE_TIMEOUT` | `6000` for large judge models, otherwise `300` | Timeout in seconds for judge model calls. Use high values (6000) as a workaround to prevent timeouts during complex reasoning. |
 | `ROUTER_FINALIZER_TIMEOUT` | `6000` | Timeout in seconds for FLASH and PRO finalizer calls. |
 | `ROUTER_OLLAMA_URL` | `http://localhost:11434/api/generate` | Ollama generate endpoint. |
