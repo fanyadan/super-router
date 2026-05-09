@@ -61,6 +61,23 @@ SUMMARY_ROUTE_KEYWORDS = (
     "结论",
     "要点",
 )
+DEFERRED_EXECUTION_KEYWORDS = (
+    "synthesize",
+    "synthesis",
+    "consolidate",
+    "combine findings",
+    "final comparison",
+    "comparison table",
+    "final table",
+    "final output",
+    "final answer",
+    "综合",
+    "汇总",
+    "整合",
+    "最终",
+    "对比表",
+    "比较表",
+)
 COMMUNICATION_AUDIENCE_KEYWORDS = (
     "产品经理",
     "项目负责人",
@@ -438,6 +455,10 @@ class RouterState(TypedDict):
     judge_index: int
     judge_desc: str
     judge_results: Annotated[Dict[int, JudgedSubtask], operator.or_]
+    execution_index: int
+    execution_subtask: Dict[str, Any]
+    execution_results: Annotated[Dict[int, StepResult], operator.or_]
+    execution_context_results: List[StepResult]
     current_step: int
     active_subtask: Dict[str, Any]
     active_route: str
@@ -596,6 +617,14 @@ def contains_any(text: str, keywords: tuple[str, ...]) -> bool:
 
 def is_summary_like_subtask(description: str) -> bool:
     return contains_any(description.lower(), SUMMARY_ROUTE_KEYWORDS)
+
+
+def is_deferred_execution_subtask(subtask: Subtask) -> bool:
+    description = subtask["desc"]
+    lowered = description.lower()
+    if is_summary_like_subtask(description) and not has_deep_work_hint(description):
+        return True
+    return contains_any(lowered, DEFERRED_EXECUTION_KEYWORDS)
 
 
 def has_deep_work_hint(description: str) -> bool:
@@ -1993,6 +2022,382 @@ def assemble_plan_node(state: RouterState) -> RouterState:
     }
 
 
+def extract_technical_metadata_for_result(state: RouterState, result: StepResult) -> List[str]:
+    step_number = result["step"]
+    step_status = result["status"]
+    active_output = result["output"].strip()
+
+    print(f"\n[Node: Metadata Extractor] 🔍 Extracting technical gold from Step {step_number}")
+
+    if (
+        not active_output
+        or "failed" in step_status
+        or step_status == "executor_fallback"
+        or "exhausted" in step_status
+    ):
+        return [f"Step {step_number} metadata extraction skipped (no output or failure)."]
+
+    prompt = (
+        f"Task: {state['task']}\n"
+        f"Subtask: {result['desc']}\n"
+        f"Output: {active_output}\n\n"
+        "Instruction: Extract the 'technical gold' from this output. "
+        "Identify: 1. Key architectural decisions, 2. Specific library/tool choices, 3. Critical logic/algorithm details, "
+        "4. CAP theorem trade-offs identified, 5. Final outcomes or verified results. "
+        "Do not summarize generally; list these as atomic, high-precision facts. "
+        "Return as a concise bulleted list."
+    )
+
+    invocation = invoke_with_provider_fallback(
+        state["pro_model"],
+        state["pro_fallback_models"],
+        prompt,
+        timeout=120,
+        num_predict=800,
+        temperature=0.0,
+        label="Metadata Extractor",
+        attempt_log=list(state["history"]),
+    )
+
+    metadata = invocation["output"] if invocation["success"] else "Metadata extraction failed."
+    return [f"--- TECHNICAL METADATA STEP {step_number} ---\n{metadata}\n---"]
+
+
+def route_to_parallel_executor_subtasks(state: RouterState) -> List[Send] | str:
+    sends = [
+        Send(
+            "parallel_executor",
+            {
+                **state,
+                "execution_index": index,
+                "execution_subtask": subtask,
+            },
+        )
+        for index, subtask in enumerate(state["subtasks"], start=1)
+        if not is_deferred_execution_subtask(subtask)
+    ]
+    if not sends:
+        return "parallel_execution_join"
+
+    print(
+        "\n[Edge: Plan -> Executor Fanout] 🚀 Dispatching "
+        f"{len(sends)} independent subtasks with LangGraph concurrency..."
+    )
+    return sends
+
+
+def route_to_deferred_executor_subtasks(state: RouterState) -> List[Send] | str:
+    sends = [
+        Send(
+            "deferred_executor",
+            {
+                **state,
+                "execution_index": index,
+                "execution_subtask": subtask,
+            },
+        )
+        for index, subtask in enumerate(state["subtasks"], start=1)
+        if is_deferred_execution_subtask(subtask)
+    ]
+    if not sends:
+        return "execution_finalize_join"
+
+    print(
+        "\n[Edge: Context Join -> Deferred Executor Fanout] 🧾 Dispatching "
+        f"{len(sends)} synthesis/reporting subtasks after parallel context is ready..."
+    )
+    return sends
+
+
+def invoke_parallel_executor_attempt(
+    state: RouterState,
+    index: int,
+    subtask: Subtask,
+    route: Literal["PRO", "FLASH"],
+    attempt_count: int,
+    retry_count: int,
+    escalated_from_flash: bool,
+    flash_review: FlashReviewResult,
+    attempt_log: List[str],
+) -> tuple[ModelInvocationResult, int]:
+    model_name = state["pro_model"] if route == PRO else state["flash_model"]
+    prompt_state = dict(state)
+    prompt_state.update(
+        {
+            "results": list(state["execution_context_results"] or state["results"]),
+            "current_step": index - 1,
+            "active_subtask": subtask,
+            "active_route": route,
+            "active_model_name": model_name,
+            "active_output": "",
+            "active_last_error": "",
+            "active_attempt_count": attempt_count,
+            "active_retry_count": retry_count,
+            "active_escalated_from_flash": escalated_from_flash,
+            "active_used_provider_fallback": False,
+            "active_flash_review": flash_review,
+            "active_attempt_log": list(attempt_log),
+            "active_invocation_result": empty_model_invocation_result(),
+        }
+    )
+
+    next_attempt_count = attempt_count + 1
+    next_attempt_log = list(attempt_log)
+    next_attempt_log.append(f"Attempt {next_attempt_count}: route={route} model={model_name}")
+    invocation = invoke_with_provider_fallback(
+        model_name,
+        route_fallback_models(state, route),
+        build_execution_prompt(prompt_state, route),
+        timeout=DEFAULT_PRO_EXECUTION_TIMEOUT if route == PRO else DEFAULT_FLASH_EXECUTION_TIMEOUT,
+        num_predict=450 if route == PRO else 240,
+        temperature=0.0,
+        label=f"{route} executor step {index}",
+        attempt_log=next_attempt_log,
+    )
+    return invocation, next_attempt_count
+
+
+def build_parallel_step_result(
+    *,
+    index: int,
+    subtask: Subtask,
+    planned_route: Literal["PRO", "FLASH"],
+    final_route: Literal["PRO", "FLASH"],
+    model_name: str,
+    output: str,
+    status: str,
+    attempt_count: int,
+    retry_count: int,
+    escalated_from_flash: bool,
+    used_provider_fallback: bool,
+    flash_review: FlashReviewResult,
+    attempt_log: List[str],
+) -> StepResult:
+    return {
+        "step": index,
+        "planned_route": planned_route,
+        "route": final_route,
+        "model_name": model_name,
+        "desc": subtask["desc"],
+        "output": output,
+        "status": status,
+        "attempt_count": attempt_count,
+        "retry_count": retry_count,
+        "escalated_from_flash": escalated_from_flash,
+        "used_provider_fallback": used_provider_fallback,
+        "flash_review": flash_review,
+        "attempt_log": attempt_log,
+    }
+
+
+def execute_subtask_in_parallel_branch(
+    state: RouterState,
+    index: int,
+    subtask: Subtask,
+) -> tuple[StepResult, List[str]]:
+    planned_route = normalize_route(subtask.get("model"), default=PRO)
+    route = planned_route
+    retry_count = 0
+    attempt_count = 0
+    escalated_from_flash = False
+    flash_review = empty_flash_review()
+    attempt_log: List[str] = []
+    errors: List[str] = []
+    output = ""
+    status = "executor_failed"
+    model_name = state["pro_model"] if route == PRO else state["flash_model"]
+    used_provider_fallback = False
+    total_steps = len(state["subtasks"])
+
+    icon = "🧠 [PRO]" if route == PRO else "⚡ [FLASH]"
+    print(
+        f"\n[Node: Parallel Executor] {icon} Step {index}/{total_steps} -> {model_name}"
+    )
+    print(
+        f"  描述: {subtask['desc']} | score={subtask['assessment']['complexity_score']} "
+        f"| conf={subtask['assessment']['confidence']:.2f}"
+    )
+
+    while True:
+        invocation, attempt_count = invoke_parallel_executor_attempt(
+            state,
+            index,
+            subtask,
+            route,
+            attempt_count,
+            retry_count,
+            escalated_from_flash,
+            flash_review,
+            attempt_log,
+        )
+        attempt_log = list(invocation["attempt_log"])
+        model_name = invocation["model_name"] or model_name
+        used_provider_fallback = invocation["used_provider_fallback"] if invocation["success"] else False
+
+        if invocation["success"]:
+            output = invocation["output"].strip()
+            status = "executed_via_provider_fallback" if used_provider_fallback else "executed"
+            last_error = ""
+        else:
+            output = ""
+            status = "executor_failed"
+            last_error = invocation["error_text"] or "Unknown execution failure"
+
+        if route == FLASH:
+            review = (
+                verify_flash_output(subtask["desc"], output, flash_review, retry_count)
+                if invocation["success"]
+                else classify_flash_execution_failure(last_error)
+            )
+            attempt_log.append(
+                f"FLASH review => decision={review['decision']} failure_type={review['failure_type']} reason={review['reason']}"
+            )
+            flash_review = review
+
+            if review["decision"] == "record":
+                break
+
+            if review["decision"] == "retry":
+                if retry_count < state["flash_retry_budget"]:
+                    retry_count += 1
+                    message = (
+                        f"Retrying FLASH for step {index} "
+                        f"({retry_count}/{state['flash_retry_budget']}) after {review['failure_type']} failure."
+                    )
+                    print(f"\n[Node: Parallel Retry Guard] 🔁 {message}")
+                    attempt_log.append(message)
+                    continue
+
+                exhausted_reason = (
+                    f"{review['reason']} Retry budget exhausted after {retry_count} retr"
+                    f"{'y' if retry_count == 1 else 'ies'}."
+                )
+                flash_review = {
+                    "decision": "record",
+                    "failure_type": review["failure_type"],
+                    "reason": exhausted_reason,
+                }
+                if not output or output.startswith("FLASH executor fallback output:"):
+                    output = (
+                        f"FLASH execution failed after {retry_count} retr"
+                        f"{'y' if retry_count == 1 else 'ies'} "
+                        f"({review['failure_type']}): {exhausted_reason}"
+                    )
+                status = "flash_retry_exhausted"
+                break
+
+            escalated_from_flash = True
+            route = PRO
+            model_name = state["pro_model"]
+            message = (
+                f"Escalated step {index} from FLASH to PRO "
+                f"because {review['failure_type']}: {review['reason']}"
+            )
+            print(f"\n[Node: Parallel Escalation] 🧠 {message}")
+            attempt_log.append(message)
+            continue
+
+        if invocation["success"]:
+            break
+
+        error = f"PRO executor fallback on step {index}: {last_error}"
+        errors.append(error)
+        output = f"PRO executor fallback output: {subtask['desc']}"
+        status = "executor_fallback"
+        print(f"\n[Node: Parallel Executor Fallback] 🧯 {error}")
+        break
+
+    result = build_parallel_step_result(
+        index=index,
+        subtask=subtask,
+        planned_route=planned_route,
+        final_route=route,
+        model_name=model_name,
+        output=output,
+        status=status,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+        escalated_from_flash=escalated_from_flash,
+        used_provider_fallback=used_provider_fallback,
+        flash_review=flash_review,
+        attempt_log=attempt_log,
+    )
+    print(f"[Node: Parallel Recorder] 已记录步骤 {index} -> {result['route']} ({result['model_name']})")
+    return result, errors
+
+
+def parallel_executor_node(state: RouterState) -> Dict[str, Any]:
+    index = state["execution_index"]
+    subtask = state["execution_subtask"]
+    try:
+        result, errors = execute_subtask_in_parallel_branch(state, index, subtask)
+    except Exception as exc:
+        error_text = compact_text(str(exc), 260)
+        subtask = state["execution_subtask"]
+        planned_route = normalize_route(subtask.get("model"), default=PRO)
+        result = build_parallel_step_result(
+            index=index,
+            subtask=subtask,
+            planned_route=planned_route,
+            final_route=planned_route,
+            model_name=state["pro_model"] if planned_route == PRO else state["flash_model"],
+            output=f"{planned_route} executor fallback output: {subtask.get('desc', 'N/A')}",
+            status="executor_fallback",
+            attempt_count=0,
+            retry_count=0,
+            escalated_from_flash=False,
+            used_provider_fallback=False,
+            flash_review=empty_flash_review(),
+            attempt_log=[f"Unhandled parallel executor exception: {error_text}"],
+        )
+        errors = [f"Parallel executor fallback on step {index}: {error_text}"]
+
+    history = [f"Recorded parallel step {index}: {result['desc']}"]
+    history.extend(extract_technical_metadata_for_result(state, result))
+    return {
+        "execution_results": {index: result},
+        "history": history,
+        "errors": errors,
+    }
+
+
+def parallel_execution_join_node(state: RouterState) -> RouterState:
+    context_results = sorted(
+        [
+            result
+            for index, result in state["execution_results"].items()
+            if not is_deferred_execution_subtask(state["subtasks"][index - 1])
+        ],
+        key=lambda result: result["step"],
+    )
+    print(
+        "\n[Node: Parallel Execution Join] 🧩 "
+        f"Collected {len(context_results)} independent subtask results."
+    )
+    return {
+        "execution_context_results": context_results,
+        "current_step": len(context_results),
+        "history": [f"Parallel executor completed {len(context_results)} independent subtasks."],
+        "status": "parallel_executed",
+    }
+
+
+def execution_finalize_join_node(state: RouterState) -> RouterState:
+    ordered_results = sorted(state["execution_results"].values(), key=lambda result: result["step"])
+    print(
+        "\n[Node: Execution Final Join] ✅ "
+        f"Collected {len(ordered_results)} total subtask results; entering finalizer."
+    )
+    return {
+        "results": ordered_results,
+        "current_step": len(ordered_results),
+        "execution_index": 0,
+        "execution_subtask": {},
+        "history": [f"Executor fanout joined {len(ordered_results)} total subtask results."],
+        "status": "ready_to_finalize",
+    }
+
+
 def dispatch_node(state: RouterState) -> RouterState:
     total_steps = len(state["subtasks"])
     if state["current_step"] >= total_steps:
@@ -2053,10 +2458,11 @@ def route_after_dispatch(state: RouterState) -> str:
 
 
 def build_execution_prompt(state: RouterState, route: Literal["PRO", "FLASH"]) -> str:
+    completed_results = state["results"]
     completed_context = "\n".join(
         [
-            f"- Step {result['step']} [{result['route']}]: {result['desc']} => {compact_text(result['output'], 120)}"
-            for result in state["results"][-3:]
+            f"- Step {result['step']} [{result['route']}]: {result['desc']} => {compact_text(result['output'], 160)}"
+            for result in completed_results
         ]
     ) or "None"
 
@@ -2159,7 +2565,10 @@ def flash_executor_node(state: RouterState) -> RouterState:
 
 def route_after_executor_result(state: RouterState) -> str:
     if state["status"] == "executor_failed":
-        return "executor_fallback" if state["active_route"] == PRO else "flash_review"
+        # RESILIENCE FIX: If PRO fails, try to la-concisely rescue with FLASH before giving up
+        if state["active_route"] == PRO:
+            return "flash_review" 
+        return "flash_review"
     if state["active_route"] == FLASH:
         return "flash_review"
     return "recorder"
@@ -2579,48 +2988,7 @@ def extract_technical_metadata_node(state: RouterState) -> Dict[str, Any]:
         return {"history": ["Metadata extraction skipped because no step result was recorded."]}
 
     latest_result = results[-1]
-    step_number = latest_result["step"]
-    step_status = latest_result["status"]
-    active_output = latest_result["output"].strip()
-
-    print(f"\n[Node: Metadata Extractor] 🔍 Extracting technical gold from Step {step_number}")
-
-    if (
-        not active_output
-        or "failed" in step_status
-        or step_status == "executor_fallback"
-        or "exhausted" in step_status
-    ):
-        return {"history": [f"Step {step_number} metadata extraction skipped (no output or failure)."]}
-
-    prompt = (
-        f"Task: {state['task']}\n"
-        f"Subtask: {latest_result['desc']}\n"
-        f"Output: {active_output}\n\n"
-        "Instruction: Extract the 'technical gold' from this output. "
-        "Identify: 1. Key architectural decisions, 2. Specific library/tool choices, 3. Critical logic/algorithm details, "
-        "4. CAP theorem trade-offs identified, 5. Final outcomes or verified results. "
-        "Do not summarize generally; list these as atomic, high-precision facts. "
-        "Return as a concise bulleted list."
-    )
-    
-    invocation = invoke_with_provider_fallback(
-        state["pro_model"],
-        state["pro_fallback_models"],
-        prompt,
-        timeout=120,
-        num_predict=800,
-        temperature=0.0,
-        label="Metadata Extractor",
-        attempt_log=list(state["history"]),
-    )
-    
-    metadata = invocation["output"] if invocation["success"] else "Metadata extraction failed."
-    
-    # We append this to history with a clear marker so the Finalizer can find it.
-    return {
-        "history": [f"--- TECHNICAL METADATA STEP {step_number} ---\n{metadata}\n---"]
-    }
+    return {"history": extract_technical_metadata_for_result(state, latest_result)}
 
 
 def pro_finalizer_node(state: RouterState) -> Dict[str, Any]:
@@ -2743,17 +3111,10 @@ def build_router_graph():
     workflow.add_node("judge_warmup", judge_warmup_node)
     workflow.add_node("judge_subtask", judge_subtask_node)
     workflow.add_node("assemble_plan", assemble_plan_node)
-    workflow.add_node("dispatcher", dispatch_node)
-    workflow.add_node("pro_executor", pro_executor_node)
-    workflow.add_node("flash_executor", flash_executor_node)
-    workflow.add_node("executor_result", executor_result_node)
-    workflow.add_node("executor_fallback", executor_fallback_node)
-    workflow.add_node("flash_review", flash_review_node)
-    workflow.add_node("retry_guard", retry_guard_node)
-    workflow.add_node("retry_flash", retry_flash_node)
-    workflow.add_node("escalation", escalation_node)
-    workflow.add_node("recorder", record_step_node)
-    workflow.add_node("metadata_extractor", extract_technical_metadata_node)
+    workflow.add_node("parallel_executor", parallel_executor_node)
+    workflow.add_node("parallel_execution_join", parallel_execution_join_node)
+    workflow.add_node("deferred_executor", parallel_executor_node)
+    workflow.add_node("execution_finalize_join", execution_finalize_join_node)
     workflow.add_node("flash_finalizer", flash_finalizer_node)
     workflow.add_node("flash_finalizer_verify", flash_finalizer_verify_node)
     workflow.add_node("pro_finalizer", pro_finalizer_node)
@@ -2790,49 +3151,11 @@ def build_router_graph():
     workflow.add_edge("planner_ready", "judge_warmup")
     workflow.add_conditional_edges("judge_warmup", route_to_judge_subtasks)
     workflow.add_edge("judge_subtask", "assemble_plan")
-    workflow.add_edge("assemble_plan", "dispatcher")
-    workflow.add_conditional_edges(
-        "dispatcher",
-        route_after_dispatch,
-        {
-            "pro_executor": "pro_executor",
-            "flash_executor": "flash_executor",
-            "flash_finalizer": "flash_finalizer",
-        },
-    )
-    workflow.add_edge("pro_executor", "executor_result")
-    workflow.add_edge("flash_executor", "executor_result")
-    workflow.add_conditional_edges(
-        "executor_result",
-        route_after_executor_result,
-        {
-            "executor_fallback": "executor_fallback",
-            "flash_review": "flash_review",
-            "recorder": "recorder",
-        },
-    )
-    workflow.add_edge("executor_fallback", "recorder")
-    workflow.add_conditional_edges(
-        "flash_review",
-        route_after_flash_review,
-        {
-            "retry_guard": "retry_guard",
-            "escalation": "escalation",
-            "recorder": "recorder",
-        },
-    )
-    workflow.add_conditional_edges(
-        "retry_guard",
-        route_after_retry_guard,
-        {
-            "retry_flash": "retry_flash",
-            "recorder": "recorder",
-        },
-    )
-    workflow.add_edge("retry_flash", "flash_executor")
-    workflow.add_edge("escalation", "pro_executor")
-    workflow.add_edge("recorder", "metadata_extractor")
-    workflow.add_edge("metadata_extractor", "dispatcher")
+    workflow.add_conditional_edges("assemble_plan", route_to_parallel_executor_subtasks)
+    workflow.add_edge("parallel_executor", "parallel_execution_join")
+    workflow.add_conditional_edges("parallel_execution_join", route_to_deferred_executor_subtasks)
+    workflow.add_edge("deferred_executor", "execution_finalize_join")
+    workflow.add_edge("execution_finalize_join", "flash_finalizer")
     workflow.add_edge("flash_finalizer", "flash_finalizer_verify")
     workflow.add_conditional_edges(
         "flash_finalizer_verify",
@@ -2952,6 +3275,10 @@ def create_initial_state(
         "judge_index": 0,
         "judge_desc": "",
         "judge_results": {},
+        "execution_index": 0,
+        "execution_subtask": {},
+        "execution_results": {},
+        "execution_context_results": [],
         "current_step": 0,
         "active_subtask": {},
         "active_route": "",
@@ -3000,6 +3327,10 @@ def summarize_stream_update(node_name: str, update: Any) -> str:
         details.append(f"planned_subtasks={len(update['planned_subtasks'])}")
     if "subtasks" in update:
         details.append(f"subtasks={len(update['subtasks'])}")
+    if "execution_results" in update:
+        details.append(f"execution_results={len(update['execution_results'])}")
+    if "execution_context_results" in update:
+        details.append(f"context_results={len(update['execution_context_results'])}")
     if "current_step" in update:
         details.append(f"current_step={update['current_step']}")
     if "active_route" in update and update["active_route"]:

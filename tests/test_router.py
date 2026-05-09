@@ -1,6 +1,7 @@
 import contextlib
 import io
 import os
+import threading
 import unittest
 from unittest import mock
 
@@ -298,7 +299,7 @@ class RouterGraphIntegrationTests(unittest.TestCase):
     def fake_generate_success(self, model, prompt, **kwargs):
         if prompt == "OK":
             return "OK"
-        if "Role: Expert task decomposer" in prompt:
+        if "Task Decomposer" in prompt or "Role: Expert task decomposer" in prompt:
             return '[{"desc":"Inspect the router state flow"},{"desc":"Prepare a concise summary"}]'
         if "Role: Complexity judge" in prompt:
             if "Prepare a concise summary" in prompt:
@@ -350,7 +351,7 @@ class RouterGraphIntegrationTests(unittest.TestCase):
         def fake_generate(model, prompt, **kwargs):
             if prompt == "OK":
                 return "OK"
-            if "Role: Expert task decomposer" in prompt:
+            if "Task Decomposer" in prompt or "Role: Expert task decomposer" in prompt:
                 return '[{"desc":"List deployment manifests"}]'
             if "Role: Complexity judge" in prompt:
                 return (
@@ -393,6 +394,59 @@ class RouterGraphIntegrationTests(unittest.TestCase):
         self.assertEqual(result["route"], r.PRO)
         self.assertTrue(result["escalated_from_flash"])
         self.assertEqual(calls, {"flash_executor": 1, "pro_executor": 1})
+
+    def test_executor_subtasks_run_in_parallel_when_concurrency_allows(self):
+        barrier = threading.Barrier(2, timeout=3)
+        broken_barrier = []
+        executor_threads = []
+
+        def fake_generate(model, prompt, **kwargs):
+            if prompt == "OK":
+                return "OK"
+            if "Task Decomposer" in prompt:
+                return (
+                    '[{"desc":"Analyze provider A architecture"},'
+                    '{"desc":"Analyze provider B architecture"}]'
+                )
+            if "Role: Complexity judge" in prompt:
+                return (
+                    '{"scores":{"reasoning_depth":2,"code_change_scope":0,"ambiguity":1,'
+                    '"risk":0,"io_heaviness":0},"suggested_route":"PRO",'
+                    '"confidence":0.9,"reason":"parallel analysis"}'
+                )
+            if "task executor" in prompt:
+                executor_threads.append(threading.get_ident())
+                try:
+                    barrier.wait()
+                except threading.BrokenBarrierError:
+                    broken_barrier.append("executor branches did not overlap")
+                return "Parallel executor completed with detailed technical analysis and enough verification detail."
+            if "Extract the 'technical gold'" in prompt:
+                return "- Parallel branch metadata was extracted."
+            if "summarizer" in prompt:
+                return (
+                    "Routing Summary\nParallel executor fanout completed.\n"
+                    "Step Outcomes\nBoth provider analyses returned usable results.\n"
+                    "Next Action\nUse the joined result set."
+                )
+            return "Fallback mocked output with sufficient detail."
+
+        with mock.patch.object(r, "generate_text", side_effect=fake_generate):
+            state, _ = run_quietly(
+                r.run_router_app,
+                "Analyze provider A and provider B independently",
+                planner_model="mock-planner",
+                judge_model="mock-judge",
+                pro_model="mock-pro",
+                flash_model="mock-flash",
+                max_concurrency=2,
+            )
+
+        self.assertEqual(state["status"], "finished")
+        self.assertEqual(len(state["results"]), 2)
+        self.assertEqual([result["step"] for result in state["results"]], [1, 2])
+        self.assertFalse(broken_barrier)
+        self.assertEqual(len(set(executor_threads)), 2)
 
     def test_streamed_graph_returns_final_state(self):
         with mock.patch.object(r, "generate_text", side_effect=self.fake_generate_success):

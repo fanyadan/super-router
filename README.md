@@ -13,7 +13,7 @@ final report generation cascade.
 
 ## What It Does
 
-- Decomposes a user task into atomic, actionable subtasks. Uses **Atomic Decomposition** to split multi-entity tasks into individual subtasks for maximum parallelism.*
+- Decomposes a user task into atomic, actionable subtasks. Uses **Atomic Decomposition** to split multi-entity tasks into individual executor branches for true LangGraph fanout.
 - Scores each subtask across reasoning depth, code change scope, ambiguity,
   risk, and IO heaviness.
 - Routes each subtask to PRO or FLASH based on structured scores, confidence,
@@ -173,12 +173,10 @@ START
   -> judge_warmup
   -> judge_subtask fanout
   -> assemble_plan
-  -> dispatcher
-  -> pro_executor or flash_executor
-  -> executor_result
-  -> flash_review, executor_fallback, or recorder
-  -> metadata_extractor
-  -> dispatcher
+  -> parallel_executor fanout
+  -> parallel_execution_join
+  -> deferred_executor fanout for synthesis/reporting subtasks
+  -> execution_finalize_join
   -> flash_finalizer
   -> flash_finalizer_verify
   -> pro_finalizer or deterministic_finalizer when needed
@@ -206,13 +204,19 @@ model_attempt_prepare -> model_invoke -> retry next provider or finish
 7. Judge fanout scores every planned subtask independently.
 8. Judge fallback applies heuristic scoring when the model call or JSON parse
    fails.
-9. Dispatcher selects the next subtask and sends it to PRO or FLASH.
-10. Executor invokes the selected route, including any provider fallbacks.
-11. FLASH review verifies FLASH output and either records, retries, or escalates
+9. Executor fanout dispatches independent subtasks concurrently through
+   LangGraph `Send(...)`, bounded by `ROUTER_MAX_CONCURRENCY`.
+10. Each executor branch invokes the selected route, including any provider
+   fallbacks.
+11. FLASH review verifies FLASH output inside the branch and either records,
+   retries, or escalates
    to PRO.
-12. Recorder stores the final step outcome and audit metadata.
-13. Metadata extractor derives atomic technical facts from successful outputs.
-14. Finalizer creates the final report with FLASH, PRO, or a deterministic
+12. Each branch records its own outcome and extracts atomic technical facts from
+   successful output.
+13. Synthesis/reporting subtasks run after the independent branches so they can
+   see completed context.
+14. The final join orders results by original step number.
+15. Finalizer creates the final report with FLASH, PRO, or a deterministic
    fallback template.
 
 ## Task Splitting
@@ -429,7 +433,7 @@ straight to the deterministic finalizer.
 | `ROUTER_FLASH_FALLBACK_MODELS` | unset | Comma-separated provider fallback list for FLASH. |
 | `ROUTER_FLASH_RETRY_BUDGET` | `1` | Number of FLASH retries for transient or unknown failures before recording failure. |
 | `ROUTER_RECURSION_LIMIT` | `128` | LangGraph recursion limit for the main router graph. |
-| `ROUTER_MAX_CONCURRENCY` | `auto` | Max concurrent subtasks executed by the Dispatcher. Essential for multi-entity atomic tasks; set to `1` for local 26B+ Judge models. |
+| `ROUTER_MAX_CONCURRENCY` | `auto` | Max concurrent LangGraph branches for judge and executor fanout. Essential for multi-entity atomic tasks; set to `1` for local 26B+ Judge models or constrained hardware. |
 | `ROUTER_JUDGE_TIMEOUT` | `6000` for large judge models, otherwise `300` | Timeout in seconds for judge model calls. Use high values (6000) as a workaround to prevent timeouts during complex reasoning. |
 | `ROUTER_FINALIZER_TIMEOUT` | `6000` | Timeout in seconds for FLASH and PRO finalizer calls. |
 | `ROUTER_OLLAMA_URL` | `http://localhost:11434/api/generate` | Ollama generate endpoint. |
@@ -650,7 +654,7 @@ export ROUTER_OLLAMA_URL=http://localhost:11434/api/generate
 ### Planner or judge is slow
 
 Large local models can take minutes, especially on first load. Use streaming and
-serialize judge fanout:
+serialize judge/executor fanout:
 
 ```bash
 export ROUTER_MAX_CONCURRENCY=1
