@@ -1400,22 +1400,19 @@ def build_fallback_subtasks(task: str) -> List[PlannedSubtask]:
 
 def build_planner_prompt(task: str) -> str:
     return (
-        "Role: Expert task decomposer.\\n"
+        "Role: Expert Technical Architect and Task Decomposer.\\n"
         f"Task: {task}\\n"
-        "Instruction: Break the task into atomic, actionable, and outcome-oriented subtasks.\\n"
-        "CRITICAL: If the task involves repeating the same action for multiple entities (e.g., research 10 providers, check 5 files, analyze 3 systems), you MUST create a separate subtask for EACH entity to enable maximum parallel execution. Do not group multiple entities into a single 'research phase' or 'bulk step'.\\n"
-        "When a task mixes investigation and reporting, keep the reporting/update step separate from the investigation step.\\n"
-        "If the task asks for a summary, update, explanation, impact note, risk note, or message for another person, you MUST emit that communication artifact as its own final subtask.\\n"
+        "Instruction: Break the task into atomic, actionable, and outcome-oriented subtasks. Each subtask must be a discrete unit of work.\\n"
+        "CRITICAL FOR PARALLELISM: If the task involves multiple entities, technologies, or components (e.g., 3 different model families, 5 providers, 10 files), you MUST create a separate subtask for EACH individual entity. Do not group them into a single 'Research' or 'Analysis' phase. One entity = One subtask.\\n"
+        "TECHNICAL GOLD REQUIREMENT: For each research or analysis subtask, explicitly aim to identify quantitative metrics, specific version numbers, architectural constants, and hard limits. This 'Technical Gold' is required for the final synthesis.\\n"
+        "Structure: When a task mixes investigation and reporting, keep the reporting/update step separate from the investigation step.\\n"
+        "Artifacts: If the task asks for a summary, update, impact note, or table, you MUST emit that as its own final subtask.\\n"
         "Do not assign model labels, complexity labels, or scores.\\n"
         "Output rules: Return a raw JSON array only. Each item must be an object with key 'desc'.\\n"
-        "Example 1 Task: Fix a flaky parser test and summarize the root cause.\\n"
-        "Example 1 Output: [{\"desc\":\"Inspect the parser failure and identify the flaky condition\"},{\"desc\":\"Implement and validate the parser fix\"},{\"desc\":\"Summarize the root cause and validation result\"}]\\n"
-        "Example 2 Task: Research the pricing of OpenAI and Anthropic.\\n"
-        "Example 2 Output: [{\"desc\":\"Research the pricing model for OpenAI\"},{\"desc\":\"Research the pricing model for Anthropic\"},{\"desc\":\"Compare pricing findings and summarize\"}]\\n"
-        "Example 3 Task: Debug an intermittent API failure and send a concise team update.\\n"
-        "Example 3 Output: [{\"desc\":\"Inspect the failing API path and isolate the root cause\"},{\"desc\":\"Prepare a concise team status update with the findings\"}]\\n"
-        "Example 4 Task: Find the main Go API bottleneck, propose two optimizations, and prepare a brief impact note for the product manager.\\n"
-        "Example 4 Output: [{\"desc\":\"Inspect the Go API bottleneck and identify the main performance constraint\"},{\"desc\":\"Propose two optimization directions based on the bottleneck analysis\"},{\"desc\":\"Prepare a brief impact note for the product manager\"}]\\n"
+        "Example 1 (Parallel): Research the KV cache of Llama-3 and Mistral-v0.3.\\n"
+        "Example 1 Output: [{\"desc\":\"Analyze Llama-3 KV cache implementation and bandwidth metrics\"},{\"desc\":\"Analyze Mistral-v0.3 KV cache implementation and bandwidth metrics\"},{\"desc\":\"Synthesize a technical comparison table of KV cache metrics\"}]\\n"
+        "Example 2: Debug an API failure and send a la-concise team update.\\n"
+        "Example 2 Output: [{\"desc\":\"Inspect the failing API path and isolate the root cause\"},{\"desc\":\"Prepare a concise team status update with the findings\"}]\\n"
         "JSON Output:"
     )
 

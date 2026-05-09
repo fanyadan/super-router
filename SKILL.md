@@ -30,6 +30,8 @@ Use super-router when you need:
 To achieve true parallel execution (when `ROUTER_MAX_CONCURRENCY > 1`), the Planner must be instructed to use **Atomic Decomposition**. 
 
 - **Atomic Decomposition**: Breaking a task into the smallest possible independent units (e.g., 10 separate research tasks for 10 companies) rather than "phases" (e.g., one giant 'Research' phase encompassing all companies).
+- **Pitfall: Planner Grouping**: Even with explicit instructions, the Planner may occasionally group multiple entities into a single subtask, which kills true parallelism.
+- **Verification**: Always verify the `planned_subtasks` count matches the entity count. If the planner groups entities, it should be treated as a capability failure and forced to retry with a correction prompt.
 - **Benefit**: This prevents 'lost-in-the-middle' failures and allows the Dispatcher to fire multiple requests simultaneously, significantly reducing wall-clock time.
 - **Implementation**: When prompting the router for multi-entity tasks, explicitly demand: *"Decompose this into exactly X independent subtasks—one subtask per entity. Do not group them into a single phase."*
 
