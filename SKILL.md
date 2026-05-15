@@ -87,21 +87,19 @@ export ROUTER_MAX_CONCURRENCY=1
 
 ## Usage
 
+### Configuring ROUTER_* Variables
+
+All `ROUTER_*` environment variables are set in `~/.hermes/.env`. Hermes Agent loads this file at startup and injects the values into every `terminal()` child process automatically — no explicit `env={}` passthrough needed. Router.py reads them via `os.environ.get()` with its own defaults for any unset variables.
+
+To see current values: `cat ~/.hermes/.env | grep ROUTER_`
+
 ### Basic Usage (via exec)
 
-When user says "走 super-router", "use super-router", or asks for router analysis:
-
-**CRITICAL:** The `terminal()` tool does NOT source `.zshrc` or `.bashrc`. You MUST explicitly pass `ROUTER_*` variables via the `env` parameter to ensure user preferences (like `ROUTER_JUDGE_MODEL=gemma4:26b`) are respected.
+When the user says "走 super-router", "use super-router", or asks for router analysis, invoke router.py directly — the `.env` values are already in the environment:
 
 ```python
-# CORRECT PATTERN: Explicitly pass env vars to avoid internal defaults
 terminal(
-    command="/opt/homebrew/Caskroom/miniforge/base/bin/python ~/.hermes/skills/mlops/inference/super-router/scripts/router.py '分析 K8s YAML 错误并重写配置'",
-    env={
-        "ROUTER_PLANNER_MODEL": "google-gemini-cli/gemini-3-pro-preview",
-        "ROUTER_JUDGE_MODEL": "gemma4:26b",
-        "ROUTER_JUDGE_TIMEOUT": "600"
-    }
+    command="/opt/homebrew/Caskroom/miniforge/base/bin/python ~/.hermes/skills/mlops/inference/super-router/scripts/router.py 'Analyze K8s YAML errors and rewrite config'"
 )
 ```
 
@@ -113,14 +111,10 @@ terminal(command="/opt/homebrew/Caskroom/miniforge/base/bin/python ~/.hermes/ski
 
 ### Via Environment Variable (Agent Compatibility)
 
-For agents that struggle with non-ASCII arguments:
+For agents that struggle with non-ASCII arguments, pass the task via `ROUTER_TASK`:
 
 ```python
-# Normalize task to short ASCII English, then pass as argument
-terminal(command="/opt/homebrew/Caskroom/miniforge/base/bin/python ~/.hermes/skills/mlops/inference/super-router/scripts/router.py 'Analyze K8s YAML errors and fix'")
-
-# Or via env var (if agent supports it)
-terminal(command="/opt/homebrew/Caskroom/miniforge/base/bin/python ~/.hermes/skills/mlops/inference/super-router/scripts/router.py", 
+terminal(command="/opt/homebrew/Caskroom/miniforge/base/bin/python ~/.hermes/skills/mlops/inference/super-router/scripts/router.py",
          env={"ROUTER_TASK": "Your complex task description"})
 ```
 
@@ -139,6 +133,8 @@ process(action="wait", session_id="<session_id_from_exec>", timeout=300)
 **Important:** Once process shows completion, your next assistant message MUST start with `Router result:` or `Router failed:` and include at least one real detail from the output (e.g., "Planner fallback", "Ollama timed out", "BTC"). Never reply with just `---`, punctuation, or empty lines.
 
 ## Environment Variables
+
+All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime and injected into every `terminal()` child process. Router.py reads them via `os.environ.get()` with its own defaults for unset variables.
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
@@ -289,6 +285,23 @@ FLASH finalizer -> (if fails) -> PRO finalizer -> (if fails) -> Deterministic te
 
 ## Troubleshooting
 
+
+### Verifying Model Routing
+
+To audit which model each stage actually used, run with `--stream` and check the output:
+
+- **Planner model**: printed as `规划模型: <model>` in the routing plan summary
+- **Judge model**: printed as `判定模型: <model>` in the routing plan summary
+- **PRO Executor**: printed as `-> <model>` per step in executor fanout (e.g. `🧠 [PRO] Step 1/5 -> google-gemini-cli/gemini-3-pro-preview`)
+- **FLASH Executor**: printed as `-> <model>` per step (e.g. `⚡ [FLASH] Step 4/5 -> google-gemini-cli/gemini-3-flash-preview`)
+- **Metadata Extractor**: uses the PRO model (verified via code at `extract_technical_metadata_for_result()`, not printed to stream)
+- **Finalizer**: routed to FLASH first, then PRO on failure — check `finalizer_outcome.route` / `finalizer_outcome.model_name` in the returned state
+
+### Non-Determinism with Cloud APIs
+
+Even at `temperature=0.0`, cloud-hosted models (Gemini, OpenRouter) may produce different decompositions across runs due to GPU floating-point non-determinism and backend inference differences. The planner prompt and temperature are identical, but the same task can yield 5 subtasks on one run and 6 on another. This is expected — the router is deterministic in its *routing logic*, not in upstream model sampling. For guaranteed reproducibility, cache planner results by task hash or use a seed parameter if the provider supports it.
+
+
 ### "Router timed out" / "Ollama returned an empty response"
 - **Best fix when keeping a large Planner:** keep `ROUTER_PLANNER_MODEL=gemma4:26b`, but set `ROUTER_JUDGE_MODEL=llama3.1:8b`.
 - **All-gemma mode:** set `ROUTER_JUDGE_MODEL=gemma4:26b`, `ROUTER_JUDGE_TIMEOUT=600`, and `ROUTER_MAX_CONCURRENCY=1`; expect much longer runs.
@@ -313,6 +326,12 @@ FLASH finalizer -> (if fails) -> PRO finalizer -> (if fails) -> Deterministic te
 ### "Planner produced only one subtask"
 - Task may be simple enough to not need decomposition
 - Planner model may be too small; try `ROUTER_PLANNER_MODEL=gemma4:31b` (if you have the patience for 90s+ waits)
+
+### "Planner produced different decompositions across identical runs"
+- When using Gemini CLI as planner, `temperature` is **not** passed through to the model — it falls back to Gemini's built-in default (typically >0). This causes non-deterministic output: the same task can decompose into 5 steps on one run and 6 on another.
+- Root cause: `generate_text()` passes `temperature=0.0` to `ollama_generate()` but drops the parameter entirely when routing to `gemini_generate()`.
+- Workaround: for reproducibility-critical tasks, use an Ollama-backed planner (temperature=0.0 IS respected there). Otherwise, accept minor variation across runs.
+- See `references/gemini-temperature-gap.md` for full code trace.
 
 ## Related Skills
 

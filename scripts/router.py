@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import operator
 import os
@@ -9,6 +10,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from typing import Annotated, Any, Callable, Dict, List, Literal, TypedDict
@@ -25,6 +27,7 @@ except Exception:
 OLLAMA_URL = os.environ.get("ROUTER_OLLAMA_URL", "http://localhost:11434/api/generate")
 ROUTER_TASK_ENV_VAR = "ROUTER_TASK"
 GEMINI_CLI_PATH = os.environ.get("ROUTER_GEMINI_CLI", shutil.which("gemini") or "/opt/homebrew/bin/gemini")
+GEMINI_SYSTEM_SETTINGS_ENV_VAR = "GEMINI_CLI_SYSTEM_SETTINGS_PATH"
 #GEMINI_EXTENSION_NAME = os.environ.get("ROUTER_GEMINI_EXTENSION", "superpowers")
 PRO = "PRO"
 FLASH = "FLASH"
@@ -1209,11 +1212,63 @@ def ollama_generate(
     return text
 
 
+def default_gemini_system_settings_path() -> str:
+    if sys.platform == "darwin":
+        return "/Library/Application Support/GeminiCli/settings.json"
+    if os.name == "nt":
+        return r"C:\ProgramData\gemini-cli\settings.json"
+    return "/etc/gemini-cli/settings.json"
+
+
+def load_gemini_system_settings() -> Dict[str, Any]:
+    settings_path = os.environ.get(GEMINI_SYSTEM_SETTINGS_ENV_VAR, "").strip()
+    if not settings_path:
+        settings_path = default_gemini_system_settings_path()
+    if not settings_path or not os.path.exists(settings_path):
+        return {}
+    try:
+        with open(settings_path, "r", encoding="utf-8") as settings_file:
+            settings = json.load(settings_file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(settings, dict):
+        return {}
+    return settings
+
+
+def build_gemini_temperature_settings(normalized_model: str, temperature: float) -> Dict[str, Any]:
+    settings = copy.deepcopy(load_gemini_system_settings())
+    model_configs = settings.get("modelConfigs")
+    if not isinstance(model_configs, dict):
+        model_configs = {}
+        settings["modelConfigs"] = model_configs
+
+    custom_overrides = model_configs.get("customOverrides")
+    if not isinstance(custom_overrides, list):
+        custom_overrides = []
+    else:
+        custom_overrides = list(custom_overrides)
+
+    custom_overrides.append(
+        {
+            "match": {"model": normalized_model},
+            "modelConfig": {
+                "generateContentConfig": {
+                    "temperature": temperature,
+                },
+            },
+        }
+    )
+    model_configs["customOverrides"] = custom_overrides
+    return settings
+
+
 def invoke_gemini_cli(
     model: str,
     prompt: str,
     *,
     timeout: int = 120,
+    temperature: float = 0.0,
 ) -> str:
     normalized_model = normalize_model_name(model)
     if not GEMINI_CLI_PATH or not os.path.exists(GEMINI_CLI_PATH):
@@ -1234,14 +1289,20 @@ def invoke_gemini_cli(
 #        GEMINI_EXTENSION_NAME,
     ]
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory(prefix="router-gemini-") as settings_dir:
+            settings_path = os.path.join(settings_dir, "settings.json")
+            with open(settings_path, "w", encoding="utf-8") as settings_file:
+                json.dump(build_gemini_temperature_settings(normalized_model, temperature), settings_file)
+            env[GEMINI_SYSTEM_SETTINGS_ENV_VAR] = settings_path
+
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                check=False,
+            )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Gemini CLI timed out after {timeout}s") from exc
 
@@ -1307,9 +1368,10 @@ def gemini_generate(
     prompt: str,
     *,
     timeout: int = 120,
+    temperature: float = 0.0,
 ) -> str:
     ensure_gemini_cli_ready(model)
-    return invoke_gemini_cli(model, prompt, timeout=timeout)
+    return invoke_gemini_cli(model, prompt, timeout=timeout, temperature=temperature)
 
 
 def generate_text(
@@ -1321,7 +1383,7 @@ def generate_text(
     temperature: float = 0.0,
 ) -> str:
     if is_gemini_model(model):
-        return gemini_generate(model, prompt, timeout=timeout)
+        return gemini_generate(model, prompt, timeout=timeout, temperature=temperature)
     return ollama_generate(
         model,
         prompt,

@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import threading
 import unittest
@@ -76,17 +77,57 @@ class RouterHelperTests(unittest.TestCase):
         self.assertEqual(high_risk["final_route"], r.PRO)
         self.assertEqual(high_risk["scores"]["risk"], 2)
 
-    def test_generate_text_honors_gemini_timeout(self):
+    def test_generate_text_honors_gemini_timeout_and_temperature(self):
         captured = []
 
-        def fake_gemini(model, prompt, *, timeout):
-            captured.append((model, prompt, timeout))
+        def fake_gemini(model, prompt, *, timeout, temperature):
+            captured.append((model, prompt, timeout, temperature))
             return "ok"
 
         with mock.patch.object(r, "gemini_generate", side_effect=fake_gemini):
-            self.assertEqual(r.generate_text("google-gemini-cli/flash", "prompt", timeout=30), "ok")
+            self.assertEqual(
+                r.generate_text("google-gemini-cli/flash", "prompt", timeout=30, temperature=0.2),
+                "ok",
+            )
 
-        self.assertEqual(captured, [("google-gemini-cli/flash", "prompt", 30)])
+        self.assertEqual(captured, [("google-gemini-cli/flash", "prompt", 30, 0.2)])
+
+    def test_invoke_gemini_cli_writes_temperature_settings(self):
+        captured = {}
+
+        class FakeResult:
+            returncode = 0
+            stdout = '{"response": "ok"}'
+            stderr = ""
+
+        def fake_run(command, *, capture_output, text, timeout, env, check):
+            captured["command"] = command
+            captured["timeout"] = timeout
+            with open(env[r.GEMINI_SYSTEM_SETTINGS_ENV_VAR], "r", encoding="utf-8") as settings_file:
+                captured["settings"] = json.load(settings_file)
+            return FakeResult()
+
+        with (
+            mock.patch.object(r, "GEMINI_CLI_PATH", "/tmp/gemini"),
+            mock.patch.object(r.os.path, "exists", return_value=True),
+            mock.patch.dict(os.environ, {r.GEMINI_SYSTEM_SETTINGS_ENV_VAR: ""}, clear=False),
+            mock.patch.object(r.subprocess, "run", side_effect=fake_run),
+        ):
+            self.assertEqual(
+                r.invoke_gemini_cli(
+                    "google-gemini-cli/gemini-3-pro-preview",
+                    "prompt",
+                    timeout=30,
+                    temperature=0.0,
+                ),
+                "ok",
+            )
+
+        override = captured["settings"]["modelConfigs"]["customOverrides"][-1]
+        self.assertEqual(captured["command"][2], "gemini-3-pro-preview")
+        self.assertEqual(captured["timeout"], 30)
+        self.assertEqual(override["match"], {"model": "gemini-3-pro-preview"})
+        self.assertEqual(override["modelConfig"]["generateContentConfig"]["temperature"], 0.0)
 
     def test_stream_event_helpers(self):
         mode, payload = r.unpack_stream_event(("namespace", "updates", {"node": {"status": "done"}}))

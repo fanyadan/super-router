@@ -131,6 +131,20 @@ python -m unittest tests/test_router.py
 
 ## Provider Selection
 
+When used as a Hermes skill, all `ROUTER_*` variables live in `~/.hermes/.env`.
+Hermes loads this file at startup and injects its values into every `terminal()`
+child process automatically — no explicit `env={}` passthrough needed.
+
+```bash
+# ~/.hermes/.env (excerpt)
+ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
+ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
+ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
+ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-pro-preview
+```
+
+For standalone CLI use, export them in your shell instead:
+
 The router selects the provider from the model name:
 
 - Gemini CLI is used when the model name is one of `auto`, `pro`, `flash`,
@@ -421,6 +435,9 @@ non-capability reason, the router skips redundant PRO escalation and goes
 straight to the deterministic finalizer.
 
 ## Environment Variables
+
+When running as a Hermes skill, set these in `~/.hermes/.env` (one `KEY=VALUE` per line).
+When running standalone, export them in your shell.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
