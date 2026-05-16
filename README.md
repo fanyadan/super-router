@@ -131,9 +131,9 @@ python -m unittest tests/test_router.py
 
 ## Provider Selection
 
-When used as a Hermes skill, all `ROUTER_*` variables live in `~/.hermes/.env`.
-Hermes loads this file at startup and injects its values into every `terminal()`
-child process automatically — no explicit `env={}` passthrough needed.
+**Environment variables are now managed through `~/.hermes/.env`** (recommended when using as a Hermes skill).
+
+Hermes automatically loads `~/.hermes/.env` at startup and injects all `ROUTER_*` variables into every `terminal()` child process. No manual `env={}` passthrough is needed.
 
 ```bash
 # ~/.hermes/.env (excerpt)
@@ -141,6 +141,9 @@ ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
 ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
 ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
 ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
+
+# Optional: skip planner + judge warmup pings for faster iteration
+# ROUTER_SKIP_WARMUP=1
 ```
 
 For standalone CLI use, export them in your shell instead:
