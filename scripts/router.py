@@ -28,6 +28,7 @@ OLLAMA_URL = os.environ.get("ROUTER_OLLAMA_URL", "http://localhost:11434/api/gen
 ROUTER_TASK_ENV_VAR = "ROUTER_TASK"
 GEMINI_CLI_PATH = os.environ.get("ROUTER_GEMINI_CLI", shutil.which("gemini") or "/opt/homebrew/bin/gemini")
 GEMINI_SYSTEM_SETTINGS_ENV_VAR = "GEMINI_CLI_SYSTEM_SETTINGS_PATH"
+ROUTER_SKIP_WARMUP = os.environ.get("ROUTER_SKIP_WARMUP", "0").lower() in ("1", "true", "yes")
 #GEMINI_EXTENSION_NAME = os.environ.get("ROUTER_GEMINI_EXTENSION", "superpowers")
 PRO = "PRO"
 FLASH = "FLASH"
@@ -1900,11 +1901,14 @@ def display_plan(subtasks: List[Subtask], planner_model: str, judge_model: str) 
 
 
 def planner_warmup_node(state: RouterState) -> Dict[str, Any]:
+    if ROUTER_SKIP_WARMUP:
+        print("[Node: Planner Warmup] ⏭️  Skipping warmup (ROUTER_SKIP_WARMUP=1)")
+        return {"planner_warmup_attempt": 3, "status": "planner_warmup_skipped"}
     attempt = state["planner_warmup_attempt"] + 1
     if attempt == 1:
         print("\n[Node: Planner Warmup] 🔥 Warming up planner model with a LangGraph loop...")
     try:
-        generate_text(state["planner_model"], "OK", timeout=180, num_predict=4)
+        generate_text(state["planner_model"], "OK", timeout=300, num_predict=4)
         print(f"[Planner Warmup] ✅ Ping {attempt}/3 successful")
     except Exception as exc:
         print(f"[Planner Warmup] ⚠️ Ping {attempt}/3 failed: {exc}")
@@ -2007,9 +2011,12 @@ def planner_ready_node(state: RouterState) -> Dict[str, Any]:
 
 
 def judge_warmup_node(state: RouterState) -> Dict[str, Any]:
+    if ROUTER_SKIP_WARMUP:
+        print("[Node: Judge Warmup] ⏭️  Skipping warmup (ROUTER_SKIP_WARMUP=1)")
+        return {"judge_warmup_done": True, "status": "judge_warmup_skipped"}
     print("\n[Node: Judge Warmup] 🔥 Warming up judge model before LangGraph fanout...")
     try:
-        generate_text(state["judge_model"], "OK", timeout=180, num_predict=4)
+        generate_text(state["judge_model"], "OK", timeout=300, num_predict=4)
         print("[Judge Warmup] ✅ Warmup successful")
         return {
             "judge_warmup_done": True,

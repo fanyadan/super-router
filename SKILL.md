@@ -314,6 +314,11 @@ Even at `temperature=0.0`, cloud-hosted models (Gemini, OpenRouter) may produce 
 - Use `--stream` plus a longer terminal/process timeout, or choose a smaller planner model.
 - Check Ollama logs: `ollama serve` output for errors
 
+### Gemini CLI Warmup Timeout Issues
+The `planner_warmup_node` and `judge_warmup_node` both use a hard-coded `timeout=180` for the "OK" ping. When using Gemini CLI this frequently fails because the CLI takes >180s to respond in non-interactive sessions.
+
+**Fix applied:** Raised warmup timeout from 180s → 300s in both nodes. If Gemini CLI warmup continues to fail, consider skipping warmup entirely for CLI-based models or increasing to 420s+ in future revisions.
+
 ### "FLASH kept escalating to PRO"
 - Task may genuinely require heavy reasoning
 - Check if FLASH model is too small for your tasks
