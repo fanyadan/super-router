@@ -1280,6 +1280,11 @@ def invoke_gemini_cli(
     env = dict(os.environ)
     env["NO_COLOR"] = "1"
     env["NO_BROWSER"] = "true"
+    # Inject Homebrew bin for ripgrep and other tools (prevents "Ripgrep is not available")
+    homebrew_bin = "/opt/homebrew/bin"
+    current_path = env.get("PATH", "")
+    if homebrew_bin not in current_path:
+        env["PATH"] = f"{homebrew_bin}:{current_path}"
     command = [
         GEMINI_CLI_PATH,
         "-m",
@@ -1287,7 +1292,8 @@ def invoke_gemini_cli(
         "-p",
         prompt,
         "-o",
-        "json"
+        "json",
+        "-y",
 #        "-e",
 #        GEMINI_EXTENSION_NAME,
     ]
@@ -1305,6 +1311,7 @@ def invoke_gemini_cli(
                 timeout=timeout,
                 env=env,
                 check=False,
+                stdin=subprocess.DEVNULL,
             )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(f"Gemini CLI timed out after {timeout}s") from exc
