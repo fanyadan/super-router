@@ -140,7 +140,7 @@ child process automatically — no explicit `env={}` passthrough needed.
 ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
 ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
 ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
-ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-pro-preview
+ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
 ```
 
 For standalone CLI use, export them in your shell instead:
@@ -154,9 +154,11 @@ The router selects the provider from the model name:
 Examples:
 
 ```bash
-# Gemini CLI-backed PRO/FLASH execution.
+# Gemini CLI-backed defaults for all router roles.
+export ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
+export ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
 export ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
-export ROUTER_FLASH_MODEL=google-gemini-cli/flash
+export ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
 
 # Ollama-backed planner/judge/executors.
 export ROUTER_PLANNER_MODEL=gemma4:26b
@@ -401,7 +403,7 @@ to fix a task that needs stronger reasoning.
 export ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
 export ROUTER_PRO_FALLBACK_MODELS=qwen3,gemma4:26b
 
-export ROUTER_FLASH_MODEL=google-gemini-cli/flash
+export ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
 export ROUTER_FLASH_FALLBACK_MODELS=qwen2.5:7b,llama3.1:8b
 ```
 
@@ -442,10 +444,10 @@ When running standalone, export them in your shell.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ROUTER_TASK` | unset | Task text used when no positional CLI task is provided. |
-| `ROUTER_PLANNER_MODEL` | `gemma4:26b` | Model used to decompose the original task into subtasks. |
-| `ROUTER_JUDGE_MODEL` | `llama3.1:8b` | Model used for structured complexity scoring. |
+| `ROUTER_PLANNER_MODEL` | `google-gemini-cli/gemini-3-pro-preview` | Model used to decompose the original task into subtasks. |
+| `ROUTER_JUDGE_MODEL` | `google-gemini-cli/gemini-3-flash-preview` | Model used for structured complexity scoring. |
 | `ROUTER_PRO_MODEL` | `google-gemini-cli/gemini-3-pro-preview` | Primary heavy reasoning executor and PRO finalizer model. |
-| `ROUTER_FLASH_MODEL` | `google-gemini-cli/flash` | Primary fast executor and FLASH finalizer model. |
+| `ROUTER_FLASH_MODEL` | `google-gemini-cli/gemini-3-flash-preview` | Primary fast executor and FLASH finalizer model. |
 | `ROUTER_PRO_FALLBACK_MODELS` | unset | Comma-separated provider fallback list for PRO. |
 | `ROUTER_FLASH_FALLBACK_MODELS` | unset | Comma-separated provider fallback list for FLASH. |
 | `ROUTER_FLASH_RETRY_BUDGET` | `1` | Number of FLASH retries for transient or unknown failures before recording failure. |
@@ -485,10 +487,10 @@ from scripts.router import run_router_app
 
 state = run_router_app(
     "Inspect router state flow and summarize",
-    planner_model="gemma4:26b",
-    judge_model="llama3.1:8b",
+    planner_model="google-gemini-cli/gemini-3-pro-preview",
+    judge_model="google-gemini-cli/gemini-3-flash-preview",
     pro_model="google-gemini-cli/gemini-3-pro-preview",
-    flash_model="google-gemini-cli/flash",
+    flash_model="google-gemini-cli/gemini-3-flash-preview",
     max_concurrency=1,
     stream=True,
 )
@@ -571,7 +573,7 @@ Useful lower-level helpers:
   "final_report": "final report text",
   "finalizer_outcome": {
     "route": "FLASH",
-    "model_name": "google-gemini-cli/flash",
+    "model_name": "google-gemini-cli/gemini-3-flash-preview",
     "status": "finished",
     "used_provider_fallback": false,
     "reason": "Finalizer output passed heuristic verification.",
@@ -678,7 +680,7 @@ export ROUTER_MAX_CONCURRENCY=1
 python scripts/router.py --stream "Analyze production K8s incident and draft summary"
 ```
 
-For speed, keep the planner strong and the judge smaller:
+When opting into local models, keep the planner strong and the judge smaller:
 
 ```bash
 export ROUTER_PLANNER_MODEL=gemma4:26b

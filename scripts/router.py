@@ -347,7 +347,9 @@ DEFAULT_FLASH_EXECUTION_TIMEOUT = 6000
 DEFAULT_PRO_FINALIZER_TIMEOUT = 6000
 DEFAULT_FLASH_FINALIZER_TIMEOUT = 6000
 DEFAULT_PRO_MODEL = "google-gemini-cli/gemini-3-pro-preview"
-DEFAULT_FLASH_MODEL = "google-gemini-cli/flash"
+DEFAULT_FLASH_MODEL = "google-gemini-cli/gemini-3-flash-preview"
+DEFAULT_PLANNER_MODEL = DEFAULT_PRO_MODEL
+DEFAULT_JUDGE_MODEL = DEFAULT_FLASH_MODEL
 GEMINI_PREFLIGHT_RESULTS: Dict[str, str] = {}
 GEMINI_NETWORK_PREFLIGHT_RESULT: str | None = None
 
@@ -3302,8 +3304,8 @@ def create_initial_state(
     flash_fallback_models: List[str] | None = None,
     flash_retry_budget: int | None = None,
 ) -> RouterState:
-    resolved_planner = resolve_model(planner_model, "ROUTER_PLANNER_MODEL", "gemma4:26b")
-    resolved_judge = resolve_model(judge_model, "ROUTER_JUDGE_MODEL", "llama3.1:8b")
+    resolved_planner = resolve_model(planner_model, "ROUTER_PLANNER_MODEL", DEFAULT_PLANNER_MODEL)
+    resolved_judge = resolve_model(judge_model, "ROUTER_JUDGE_MODEL", DEFAULT_JUDGE_MODEL)
     resolved_pro = resolve_execution_model(pro_model, "ROUTER_PRO_MODEL", DEFAULT_PRO_MODEL)
     resolved_flash = resolve_execution_model(flash_model, "ROUTER_FLASH_MODEL", DEFAULT_FLASH_MODEL)
     resolved_pro_fallback_models = resolve_model_list(

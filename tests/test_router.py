@@ -21,6 +21,8 @@ class RouterHelperTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
+                "ROUTER_PLANNER_MODEL": "",
+                "ROUTER_JUDGE_MODEL": "",
                 "ROUTER_PRO_MODEL": "",
                 "ROUTER_FLASH_MODEL": "",
                 "ROUTER_DEBUG": "",
@@ -30,6 +32,8 @@ class RouterHelperTests(unittest.TestCase):
         ):
             state = r.create_initial_state("default check")
 
+        self.assertEqual(state["planner_model"], r.DEFAULT_PLANNER_MODEL)
+        self.assertEqual(state["judge_model"], r.DEFAULT_JUDGE_MODEL)
         self.assertEqual(state["pro_model"], r.DEFAULT_PRO_MODEL)
         self.assertEqual(state["flash_model"], r.DEFAULT_FLASH_MODEL)
         self.assertEqual(state["flash_retry_budget"], r.DEFAULT_FLASH_RETRY_BUDGET)

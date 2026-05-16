@@ -52,10 +52,10 @@ To achieve true parallel execution (when `ROUTER_MAX_CONCURRENCY > 1`), the Plan
 ## Installation
 
 ```bash
-# Required: LangGraph + Ollama
+# Required: LangGraph
 pip install langgraph
 
-# Ensure Ollama is running locally
+# If you use Ollama-backed roles, ensure Ollama is running locally
 ollama serve
 
 # Pull recommended models if you use Ollama-backed roles
@@ -65,7 +65,7 @@ ollama pull qwen3         # PRO executor
 ollama pull qwen2.5:7b    # FLASH executor
 ```
 
-**Note:** If you prefer `gemma4:26b` as the Planner, keep it there. For speed, the Judge should usually be `llama3.1:8b` or another 7B-14B model:
+By default, planner and judge use Gemini CLI-backed models. To opt into local Ollama models, keep the Planner strong and use a smaller Judge:
 
 ```bash
 export ROUTER_PLANNER_MODEL=gemma4:26b
@@ -138,10 +138,10 @@ All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime 
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `ROUTER_PLANNER_MODEL` | Task decomposition model | `gemma4:26b` |
-| `ROUTER_JUDGE_MODEL` | Complexity scoring model | `llama3.1:8b` |
+| `ROUTER_PLANNER_MODEL` | Task decomposition model | `google-gemini-cli/gemini-3-pro-preview` |
+| `ROUTER_JUDGE_MODEL` | Complexity scoring model | `google-gemini-cli/gemini-3-flash-preview` |
 | `ROUTER_PRO_MODEL` | Heavy reasoning executor | `google-gemini-cli/gemini-3-pro-preview` |
-| `ROUTER_FLASH_MODEL` | Fast executor | `google-gemini-cli/flash` |
+| `ROUTER_FLASH_MODEL` | Fast executor | `google-gemini-cli/gemini-3-flash-preview` |
 | `ROUTER_PRO_FALLBACK_MODELS` | Comma-separated PRO fallback list | None |
 | `ROUTER_FLASH_FALLBACK_MODELS` | Comma-separated FLASH fallback list | None |
 | `ROUTER_FLASH_RETRY_BUDGET` | Max FLASH retries before escalation | 1 |
@@ -154,7 +154,7 @@ All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime 
 | `ROUTER_FINALIZER_TIMEOUT` | Timeout for the final reporting synthesis (seconds). Essential to set high (e.g., 600) for complex tasks to avoid timeouts during context assembly. | 600 |
 | `ROUTER_DEBUG` | Print raw planner/judge/Ollama diagnostic snippets | Off |
 
-**For large models (20B+ like gemma4:26b):**
+**For optional large local models (20B+ like gemma4:26b):**
 - Prefer `ROUTER_PLANNER_MODEL=gemma4:26b` with `ROUTER_JUDGE_MODEL=llama3.1:8b`
 - If using `ROUTER_JUDGE_MODEL=gemma4:26b`, set `ROUTER_JUDGE_TIMEOUT=600` and keep `ROUTER_MAX_CONCURRENCY=1`
 - Planner timeout is auto-set to 300s for large models
@@ -303,11 +303,11 @@ Even at `temperature=0.0`, cloud-hosted models (Gemini, OpenRouter) may produce 
 
 
 ### "Router timed out" / "Ollama returned an empty response"
-- **Best fix when keeping a large Planner:** keep `ROUTER_PLANNER_MODEL=gemma4:26b`, but set `ROUTER_JUDGE_MODEL=llama3.1:8b`.
+- **Best fix when using a large Ollama Planner:** keep `ROUTER_PLANNER_MODEL=gemma4:26b`, but set `ROUTER_JUDGE_MODEL=llama3.1:8b`.
 - **All-gemma mode:** set `ROUTER_JUDGE_MODEL=gemma4:26b`, `ROUTER_JUDGE_TIMEOUT=600`, and `ROUTER_MAX_CONCURRENCY=1`; expect much longer runs.
 - Use `--stream` and increase the terminal/process timeout if the Planner itself may take longer than 60s.
 - Set `ROUTER_JUDGE_TIMEOUT=300` or higher only when intentionally using a 20B+ Judge.
-- Alternative: use Gemini CLI for planning: `ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview`.
+- If Ollama appears unexpectedly, check whether Hermes injected stale `ROUTER_PLANNER_MODEL` or `ROUTER_JUDGE_MODEL` values.
 
 ### "Planner timed out after 30s" (or 90s)
 - Model is too large or not loaded. Warmup helps but large models may still timeout.
