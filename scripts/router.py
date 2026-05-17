@@ -1319,7 +1319,28 @@ def invoke_gemini_cli(
 
     stdout = result.stdout.strip()
     stderr = result.stderr.strip()
+
+    # Filter known benign Gemini CLI tool warnings (YOLO mode, ripgrep fallback, etc.)
+    # These are non-fatal and should not cause the call to fail
+    BENIGN_WARNINGS = [
+        "YOLO mode is enabled",
+        "All tool calls will be automatically approved",
+        "Ripgrep is not available",
+        "Falling back to GrepTool",
+        "ripgrep",
+    ]
+
+    def _strip_benign_warnings(text: str) -> str:
+        if not text:
+            return ""
+        lines = text.splitlines()
+        filtered = [line for line in lines if not any(w.lower() in line.lower() for w in BENIGN_WARNINGS)]
+        return "\n".join(filtered).strip()
+
+    stdout = _strip_benign_warnings(stdout)
+    stderr = _strip_benign_warnings(stderr)
     payload_text = stdout or stderr
+
     parsed_payload: Dict[str, Any] | None = None
     if payload_text:
         try:
@@ -1338,7 +1359,9 @@ def invoke_gemini_cli(
             )
         else:
             error_text = compact_text(stderr or stdout or f"exit code {result.returncode}", 280)
-        raise RuntimeError(f"Gemini CLI failed for model {normalized_model}: {error_text}")
+        # Only raise if we still have a real error after filtering warnings
+        if error_text and not any(w.lower() in error_text.lower() for w in BENIGN_WARNINGS):
+            raise RuntimeError(f"Gemini CLI failed for model {normalized_model}: {error_text}")
 
     if parsed_payload and isinstance(parsed_payload.get("error"), dict):
         error_block = parsed_payload["error"]
@@ -1346,7 +1369,8 @@ def invoke_gemini_cli(
             str(error_block.get("message") or error_block.get("type") or payload_text),
             280,
         )
-        raise RuntimeError(f"Gemini CLI returned an error for model {normalized_model}: {error_text}")
+        if error_text and not any(w.lower() in error_text.lower() for w in BENIGN_WARNINGS):
+            raise RuntimeError(f"Gemini CLI returned an error for model {normalized_model}: {error_text}")
 
     if parsed_payload and str(parsed_payload.get("response", "")).strip():
         return str(parsed_payload["response"]).strip()
