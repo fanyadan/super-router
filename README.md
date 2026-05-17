@@ -11,6 +11,10 @@ stronger model. It includes planner and judge fallback paths, provider fallback
 lists, FLASH retry and escalation logic, technical metadata extraction, and a
 final report generation cascade.
 
+## Workflow
+
+![Super-Router LangGraph Architecture](super-router.png)
+
 ## What It Does
 
 - Decomposes a user task into atomic, actionable subtasks. Uses **Atomic Decomposition** to split multi-entity tasks into individual executor branches for true LangGraph fanout.
