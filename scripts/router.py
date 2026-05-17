@@ -1280,11 +1280,12 @@ def invoke_gemini_cli(
     env = dict(os.environ)
     env["NO_COLOR"] = "1"
     env["NO_BROWSER"] = "true"
-    # Inject Homebrew bin for ripgrep and other tools (prevents "Ripgrep is not available")
-    homebrew_bin = "/opt/homebrew/bin"
+    # Force inject ripgrep + common tool paths (fixes "Ripgrep is not available" warning)
+    extra_paths = ["/opt/homebrew/bin", "/usr/local/bin"]
     current_path = env.get("PATH", "")
-    if homebrew_bin not in current_path:
-        env["PATH"] = f"{homebrew_bin}:{current_path}"
+    path_parts = [p for p in extra_paths if p not in current_path.split(":")]
+    if path_parts:
+        env["PATH"] = ":".join(path_parts + [current_path]) if current_path else ":".join(path_parts)
     command = [
         GEMINI_CLI_PATH,
         "-m",
