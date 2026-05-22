@@ -105,6 +105,7 @@ COMMUNICATION_AUDIENCE_KEYWORDS = (
 DEEP_WORK_HINT_KEYWORDS = (
     "inspect",
     "check",
+    "audit",
     "examine",
     "identify",
     "compare",
