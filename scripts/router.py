@@ -1085,7 +1085,7 @@ def decide_route(
 
     if summary_like and not deep_work_hint:
         return FLASH
-    if summary_like and scores["io_heaviness"] >= 1 and scores["code_change_scope"] <= 1 and scores["risk"] <= 1:
+    if summary_like and not deep_work_hint and scores["io_heaviness"] >= 1 and scores["code_change_scope"] <= 1 and scores["risk"] <= 1:
         return FLASH
     if high_risk_core_step:
         return PRO

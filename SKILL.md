@@ -261,6 +261,14 @@ To audit which model each stage actually used, run with `--stream` and check the
 - **Metadata Extractor**: uses the PRO model
 - **Finalizer**: routed to FLASH first, then PRO on failure — check `finalizer_outcome.route` / `finalizer_outcome.model_name` in the returned state
 
+**Verification Audit Pattern**: For explicit per-phase LLM validation runs (e.g. K8s anomaly detection tasks), execute the router with a complex high-risk task, capture the full streaming transcript, then synthesize a self-contained HTML report. The report should include:
+- Phase cards showing attempted model vs actual outcome (including heuristic fallbacks on quota errors)
+- Routing decision table
+- Key findings on whether PRO/FLASH routing matched expectations
+- Recommendations for fallback configuration
+
+This produces an auditable artifact that confirms the 5-node flow (Planner → Judge → Executor Fanout → Metadata → Finalizer) and surfaces any provider-specific issues like TerminalQuotaError without altering the core router logic.
+
 ### Non-Determinism with Cloud APIs
 
 Even at `temperature=0.0`, cloud-hosted models may produce different decompositions across runs due to backend inference differences. The router is deterministic in its *routing logic*, not in upstream model sampling. For guaranteed reproducibility, cache planner results by task hash or use a seed parameter if the provider supports it.
