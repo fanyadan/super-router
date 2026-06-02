@@ -55,6 +55,9 @@ To achieve true parallel execution (when `ROUTER_MAX_CONCURRENCY > 1`), the Plan
 ```bash
 # Required: LangGraph
 pip install langgraph
+
+# Optional: LangSmith telemetry
+pip install langsmith
 ```
 
 All model and provider choices are configured via `ROUTER_*` variables in the Hermes environment config file `~/.hermes/.env`. The router reads these with internal defaults for any unset variables. No model names are hardcoded in the skill.
@@ -125,8 +128,46 @@ All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime 
 | `ROUTER_OLLAMA_URL` | Ollama API endpoint (if used) | `http://localhost:11434/api/generate` |
 | `ROUTER_FINALIZER_TIMEOUT` | Timeout for the final reporting synthesis (seconds) | 600 |
 | `ROUTER_DEBUG` | Print raw diagnostic snippets | Off |
+| `ROUTER_LANGSMITH_ENABLED` | Enable optional LangSmith graph and model-call telemetry when `LANGSMITH_API_KEY` is set | Off |
+| `ROUTER_LANGSMITH_PROJECT` | LangSmith project name | `super-router` |
+| `ROUTER_LANGSMITH_TAGS` | Comma-separated extra LangSmith tags | None |
+| `ROUTER_LANGSMITH_TRACE_PROMPTS` | Include prompt previews in custom model-call traces | Off |
+| `ROUTER_LANGSMITH_TRACE_OUTPUTS` | Include output previews in custom model-call traces | Off |
+| `ROUTER_LANGSMITH_HIDE_INPUTS` | Request LangSmith SDK input hiding for graph traces | Off |
+| `ROUTER_LANGSMITH_HIDE_OUTPUTS` | Request LangSmith SDK output hiding for graph traces | Off |
+| `ROUTER_LANGSMITH_FLUSH` | Flush LangSmith traces before process exit | On |
+| `ROUTER_TOKEN_USAGE_LEDGER` | Optional append-only JSONL path for per-call token usage records | None |
 
 Large local models may require higher timeouts and `ROUTER_MAX_CONCURRENCY=1`.
+
+### LangSmith Telemetry
+
+LangSmith is optional and non-fatal. Enable it only when external trace upload
+is desired:
+
+```bash
+ROUTER_LANGSMITH_ENABLED=1
+LANGSMITH_API_KEY=<your-langsmith-key>
+ROUTER_LANGSMITH_PROJECT=super-router
+```
+
+The router adds graph tags/metadata and traces raw Gemini CLI/Ollama calls as
+child LLM runs. Ollama token usage is captured from `prompt_eval_count` and
+`eval_count`. Gemini CLI token usage is captured from JSON
+`stats.models.*.tokens` when available, with `usageMetadata`-style fields as a
+fallback. Prompt and output text previews are disabled by default; enable them
+explicitly with `ROUTER_LANGSMITH_TRACE_PROMPTS=1` or
+`ROUTER_LANGSMITH_TRACE_OUTPUTS=1`.
+
+### Token Usage Accounting
+
+Token usage is tracked even when LangSmith is disabled. The router records every
+successful provider call in a run-local ledger, prints a token summary after the
+final report, and returns `token_usage` plus `token_usage_summary` in the final
+state. Calls without provider token data are recorded as
+`usage_source=unavailable`. Set
+`ROUTER_TOKEN_USAGE_LEDGER=~/.hermes/super-router-usage.jsonl` to persist the
+per-call records as append-only JSONL.
 
 ## Complexity Routing Rules
 

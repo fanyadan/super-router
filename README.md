@@ -57,6 +57,8 @@ final report generation cascade.
 
 - Python 3.10+ is recommended because the code uses modern type hint syntax.
 - `langgraph` is required at runtime.
+- `langsmith` is optional for telemetry. It is commonly installed with
+  LangGraph, but can be installed explicitly with `pip install langsmith`.
 - At least one model provider must be usable:
   - Gemini CLI for `google-gemini-cli/...`, `gemini-*`, `pro`, `flash`, `flash-lite`, or `auto` model names.
   - Ollama for all other model names.
@@ -146,6 +148,12 @@ ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
 ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
 ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
 
+# Optional: enable LangSmith graph/model-call telemetry
+# ROUTER_LANGSMITH_ENABLED=1
+# LANGSMITH_API_KEY=lsv2_...
+# ROUTER_LANGSMITH_PROJECT=super-router
+# ROUTER_LANGSMITH_TAGS=local,hermes
+
 # Optional: skip planner + judge warmup pings for faster iteration
 # ROUTER_SKIP_WARMUP=1
 ```
@@ -181,6 +189,54 @@ export ROUTER_PLANNER_MODEL=gemma4:26b
 export ROUTER_JUDGE_MODEL=llama3.1:8b
 export ROUTER_MAX_CONCURRENCY=1
 ```
+
+## LangSmith Telemetry
+
+LangSmith is a good fit for this router because execution is already organized
+as LangGraph nodes. Enable it only when you want external traces:
+
+```bash
+export ROUTER_LANGSMITH_ENABLED=1
+export LANGSMITH_API_KEY=<your-langsmith-key>
+export ROUTER_LANGSMITH_PROJECT=super-router
+```
+
+When enabled, the router attaches `super-router`/`langgraph` tags, model
+metadata, retry budget, and task length to the graph run. Raw Gemini CLI and
+Ollama calls are traced as `Super Router Model Call` child runs with prompt and
+output lengths by default. Ollama traces include token usage from
+`prompt_eval_count` and `eval_count`. Gemini CLI traces include token usage from
+JSON output when available, preferring `stats.models.*.tokens` and falling back
+to `usageMetadata`-style fields. To include text previews, opt in with
+`ROUTER_LANGSMITH_TRACE_PROMPTS=1` or `ROUTER_LANGSMITH_TRACE_OUTPUTS=1`.
+
+LangSmith can calculate cost when token usage is present and the provider/model
+matches LangSmith pricing or custom pricing configured in LangSmith. Ollama
+usually needs custom pricing if you want dollar-cost estimates.
+
+For sensitive workloads, prefer `ROUTER_LANGSMITH_HIDE_INPUTS=1` and
+`ROUTER_LANGSMITH_HIDE_OUTPUTS=1`, or keep telemetry disabled. Missing
+LangSmith packages or API keys are non-fatal; the router continues without
+telemetry.
+
+## Token Usage Accounting
+
+The router records token usage independently of LangSmith. Every successful
+provider call is added to an in-process run ledger and printed after the final
+report.
+
+- Ollama usage comes from `prompt_eval_count` and `eval_count`.
+- Gemini CLI usage comes from JSON `stats.models.*.tokens` fields such as
+  `prompt`, `candidates`, `thoughts`, `cached`, `tool`, and `total`.
+- If a provider response does not include token data, the call is still recorded
+  as `usage_source=unavailable` and excluded from token totals.
+
+The final router state includes `token_usage` for per-call records and
+`token_usage_summary` for aggregated totals by model and provider.
+
+Set `ROUTER_TOKEN_USAGE_LEDGER=~/.hermes/super-router-usage.jsonl` to persist
+the same per-call records as append-only JSONL. Each line includes run metadata,
+the aggregate summary, and one provider-call record.
 
 ## Architecture
 
@@ -465,6 +521,15 @@ When running standalone, export them in your shell.
 | `ROUTER_OLLAMA_URL` | `http://localhost:11434/api/generate` | Ollama generate endpoint. |
 | `ROUTER_GEMINI_CLI` | first `gemini` on `PATH`, else `/opt/homebrew/bin/gemini` | Gemini CLI executable path. |
 | `ROUTER_DEBUG` | false | Enables raw planner, judge, and Ollama diagnostic output when set to `1`, `true`, `yes`, `on`, or `debug`. |
+| `ROUTER_LANGSMITH_ENABLED` | false | Enables optional LangSmith tracing when `langsmith` and `LANGSMITH_API_KEY` are available. |
+| `ROUTER_LANGSMITH_PROJECT` | `super-router` | LangSmith project name; falls back to `LANGSMITH_PROJECT` when set. |
+| `ROUTER_LANGSMITH_TAGS` | unset | Comma-separated extra LangSmith tags appended to `super-router,langgraph`. |
+| `ROUTER_LANGSMITH_TRACE_PROMPTS` | false | Adds prompt previews to custom model-call traces. |
+| `ROUTER_LANGSMITH_TRACE_OUTPUTS` | false | Adds output previews to custom model-call traces. |
+| `ROUTER_LANGSMITH_HIDE_INPUTS` | false | Requests LangSmith SDK input hiding for graph traces. |
+| `ROUTER_LANGSMITH_HIDE_OUTPUTS` | false | Requests LangSmith SDK output hiding for graph traces. Token counts are still retained when available. |
+| `ROUTER_LANGSMITH_FLUSH` | true | Flushes LangSmith traces before the CLI process exits. |
+| `ROUTER_TOKEN_USAGE_LEDGER` | unset | Optional JSONL path for appending per-call token usage records, e.g. `~/.hermes/super-router-usage.jsonl`. |
 
 The PRO executor timeout, FLASH executor timeout, and default finalizer timeouts
 are conservative in the current code (`6000` seconds) to support long-running
@@ -586,6 +651,25 @@ Useful lower-level helpers:
     "reason": "Finalizer output passed heuristic verification.",
     "attempt_log": ["audit log entries"]
   },
+  "token_usage": [
+    {
+      "label": "Planner invoke",
+      "provider": "google_genai",
+      "model_name": "gemini-3-pro-preview",
+      "usage_source": "gemini_cli_stats",
+      "input_tokens": 1000,
+      "output_tokens": 250,
+      "total_tokens": 1250
+    }
+  ],
+  "token_usage_summary": {
+    "calls": 1,
+    "calls_with_usage": 1,
+    "calls_without_usage": 0,
+    "input_tokens": 1000,
+    "output_tokens": 250,
+    "total_tokens": 1250
+  },
   "status": "finished"
 }
 ```
@@ -621,6 +705,7 @@ Current tests cover:
 - communication subtask splitting
 - contextual routing biases
 - Gemini timeout forwarding
+- provider token usage parsing and run-level accounting
 - stream event helpers
 - provider fallback retries and capability stop behavior
 - FLASH review, retry, and escalation guards
@@ -757,3 +842,4 @@ Expected behavior:
 - `SKILL.md` for Hermes-specific usage instructions.
 - LangGraph documentation: https://langchain-ai.github.io/langgraph/
 - Ollama documentation: https://ollama.com/docs
+- Gemini CLI headless JSON output: https://google-gemini.github.io/gemini-cli/docs/cli/headless.html

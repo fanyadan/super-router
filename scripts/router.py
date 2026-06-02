@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
 import copy
+import datetime
 import json
 import operator
 import os
@@ -11,12 +14,19 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
-from typing import Annotated, Any, Callable, Dict, List, Literal, TypedDict
+import uuid
+from typing import Annotated, Any, Callable, Dict, Iterator, List, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
+
+try:
+    import langsmith as _langsmith
+except Exception:
+    _langsmith = None
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -29,6 +39,10 @@ ROUTER_TASK_ENV_VAR = "ROUTER_TASK"
 GEMINI_CLI_PATH = os.environ.get("ROUTER_GEMINI_CLI", shutil.which("gemini") or "/opt/homebrew/bin/gemini")
 GEMINI_SYSTEM_SETTINGS_ENV_VAR = "GEMINI_CLI_SYSTEM_SETTINGS_PATH"
 ROUTER_SKIP_WARMUP = os.environ.get("ROUTER_SKIP_WARMUP", "0").lower() in ("1", "true", "yes")
+ROUTER_LANGSMITH_ENABLED_ENV_VAR = "ROUTER_LANGSMITH_ENABLED"
+ROUTER_LANGSMITH_PROJECT_ENV_VAR = "ROUTER_LANGSMITH_PROJECT"
+ROUTER_LANGSMITH_TAGS_ENV_VAR = "ROUTER_LANGSMITH_TAGS"
+ROUTER_TOKEN_USAGE_LEDGER_ENV_VAR = "ROUTER_TOKEN_USAGE_LEDGER"
 #GEMINI_EXTENSION_NAME = os.environ.get("ROUTER_GEMINI_EXTENSION", "superpowers")
 PRO = "PRO"
 FLASH = "FLASH"
@@ -354,6 +368,10 @@ DEFAULT_PLANNER_MODEL = DEFAULT_PRO_MODEL
 DEFAULT_JUDGE_MODEL = DEFAULT_FLASH_MODEL
 GEMINI_PREFLIGHT_RESULTS: Dict[str, str] = {}
 GEMINI_NETWORK_PREFLIGHT_RESULT: str | None = None
+TOKEN_USAGE_RUN_ID: contextvars.ContextVar[str] = contextvars.ContextVar("TOKEN_USAGE_RUN_ID", default="")
+TOKEN_USAGE_LOCK = threading.RLock()
+TOKEN_USAGE_RECORDS_BY_RUN: Dict[str, List["TokenUsageRecord"]] = {}
+TOKEN_USAGE_ACTIVE_RUN_IDS: set[str] = set()
 
 
 class PlannedSubtask(TypedDict):
@@ -389,6 +407,47 @@ class ModelInvocationResult(TypedDict):
     failure_type: Literal["none", "infra_transient", "capability_quality", "unknown"]
     error_text: str
     attempt_log: List[str]
+
+
+class TextGenerationResult(TypedDict):
+    text: str
+    usage_metadata: Dict[str, int]
+    provider: str
+    model_name: str
+    usage_source: str
+
+
+class TokenUsageRecord(TypedDict):
+    run_id: str
+    call_index: int
+    label: str
+    provider: str
+    model_name: str
+    usage_source: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cached_tokens: int
+    candidate_tokens: int
+    thought_tokens: int
+    tool_tokens: int
+    prompt_chars: int
+    output_chars: int
+
+
+class TokenUsageSummary(TypedDict):
+    calls: int
+    calls_with_usage: int
+    calls_without_usage: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cached_tokens: int
+    candidate_tokens: int
+    thought_tokens: int
+    tool_tokens: int
+    by_model: Dict[str, Dict[str, int]]
+    by_provider: Dict[str, Dict[str, int]]
 
 
 class ModelInvocationState(TypedDict):
@@ -445,6 +504,7 @@ class StepResult(TypedDict):
 
 
 class RouterState(TypedDict):
+    run_id: str
     task: str
     planner_model: str
     judge_model: str
@@ -489,6 +549,8 @@ class RouterState(TypedDict):
     finalizer_error: str
     finalizer_flash_reason: str
     finalizer_invocation_result: ModelInvocationResult
+    token_usage: List[TokenUsageRecord]
+    token_usage_summary: TokenUsageSummary
 
 
 def resolve_model(explicit_value: str | None, env_name: str, fallback: str) -> str:
@@ -871,6 +933,7 @@ def model_invoke_node(state: ModelInvocationState) -> Dict[str, Any]:
             timeout=state["timeout"],
             num_predict=state["num_predict"],
             temperature=state["temperature"],
+            usage_label=state["label"],
         )
         log.append(f"{state['label']} succeeded with model {model_name}.")
         return {
@@ -1119,6 +1182,677 @@ def is_gemini_model(model: str) -> bool:
     return normalized in {"auto", "pro", "flash", "flash-lite"} or normalized.startswith("gemini-")
 
 
+def langsmith_provider_name(model: str) -> str:
+    return "google_genai" if is_gemini_model(model) else "ollama"
+
+
+def build_text_generation_result(
+    text: str,
+    usage_metadata: Dict[str, int] | None,
+    provider: str,
+    model_name: str,
+    usage_source: str = "unavailable",
+) -> TextGenerationResult:
+    return {
+        "text": text,
+        "usage_metadata": usage_metadata or {},
+        "provider": provider,
+        "model_name": model_name,
+        "usage_source": usage_source if usage_metadata else "unavailable",
+    }
+
+
+def coerce_non_negative_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def normalize_usage_metadata(
+    *,
+    input_tokens: Any = None,
+    output_tokens: Any = None,
+    total_tokens: Any = None,
+    cached_tokens: Any = None,
+    thought_tokens: Any = None,
+    tool_tokens: Any = None,
+    candidates_tokens: Any = None,
+) -> Dict[str, int]:
+    input_count = coerce_non_negative_int(input_tokens)
+    output_count = coerce_non_negative_int(output_tokens)
+    candidates_count = coerce_non_negative_int(candidates_tokens)
+    thought_count = coerce_non_negative_int(thought_tokens)
+    total_count = coerce_non_negative_int(total_tokens)
+    cached_count = coerce_non_negative_int(cached_tokens)
+    tool_count = coerce_non_negative_int(tool_tokens)
+    if output_count is None and (candidates_count is not None or thought_count is not None):
+        output_count = (candidates_count or 0) + (thought_count or 0)
+    if total_count is None and input_count is not None and output_count is not None:
+        total_count = input_count + output_count + (tool_count or 0)
+    if output_count is None and total_count is not None and input_count is not None:
+        output_count = max(0, total_count - input_count)
+    if input_count is None and total_count is not None and output_count is not None:
+        input_count = max(0, total_count - output_count)
+
+    usage: Dict[str, int] = {}
+    if input_count is not None:
+        usage["input_tokens"] = input_count
+    if output_count is not None:
+        usage["output_tokens"] = output_count
+    if total_count is not None:
+        usage["total_tokens"] = total_count
+    if cached_count is not None:
+        usage["cached_tokens"] = cached_count
+    if thought_count is not None:
+        usage["thought_tokens"] = thought_count
+    if tool_count is not None:
+        usage["tool_tokens"] = tool_count
+    if candidates_count is not None:
+        usage["candidate_tokens"] = candidates_count
+    return usage
+
+
+def extract_ollama_usage_metadata(data: Dict[str, Any]) -> Dict[str, int]:
+    return normalize_usage_metadata(
+        input_tokens=data.get("prompt_eval_count"),
+        output_tokens=data.get("eval_count"),
+    )
+
+
+def extract_gemini_cli_stats_usage_metadata(payload: Any) -> Dict[str, int]:
+    if not isinstance(payload, dict):
+        return {}
+    stats = payload.get("stats")
+    if not isinstance(stats, dict):
+        return {}
+    models = stats.get("models")
+    if not isinstance(models, dict):
+        return {}
+
+    totals = {
+        "prompt": 0,
+        "candidates": 0,
+        "total": 0,
+        "cached": 0,
+        "thoughts": 0,
+        "tool": 0,
+    }
+    saw_tokens = False
+    for model_stats in models.values():
+        if not isinstance(model_stats, dict):
+            continue
+        tokens = model_stats.get("tokens")
+        if not isinstance(tokens, dict):
+            continue
+        token_values: Dict[str, int] = {}
+        for key in totals:
+            value = coerce_non_negative_int(tokens.get(key))
+            if value is not None:
+                token_values[key] = value
+        if not token_values:
+            continue
+        saw_tokens = True
+        for key, value in token_values.items():
+            totals[key] += value
+
+    if not saw_tokens:
+        return {}
+    return normalize_usage_metadata(
+        input_tokens=totals["prompt"],
+        candidates_tokens=totals["candidates"],
+        total_tokens=totals["total"],
+        cached_tokens=totals["cached"],
+        thought_tokens=totals["thoughts"],
+        tool_tokens=totals["tool"],
+    )
+
+
+def first_present_value(data: Dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in data:
+            return data[key]
+    return None
+
+
+def extract_usage_metadata_from_mapping(data: Dict[str, Any]) -> Dict[str, int]:
+    return normalize_usage_metadata(
+        input_tokens=first_present_value(
+            data,
+            (
+                "input_tokens",
+                "prompt_tokens",
+                "prompt_token_count",
+                "promptTokenCount",
+            ),
+        ),
+        output_tokens=first_present_value(
+            data,
+            (
+                "output_tokens",
+                "completion_tokens",
+                "completion_token_count",
+                "completionTokenCount",
+            ),
+        ),
+        candidates_tokens=first_present_value(
+            data,
+            (
+                "candidate_tokens",
+                "candidates_tokens",
+                "candidates_token_count",
+                "candidatesTokenCount",
+            ),
+        ),
+        total_tokens=first_present_value(
+            data,
+            (
+                "total_tokens",
+                "total_token_count",
+                "totalTokenCount",
+            ),
+        ),
+        cached_tokens=first_present_value(
+            data,
+            (
+                "cached_tokens",
+                "cached_token_count",
+                "cachedContentTokenCount",
+                "cached_content_token_count",
+            ),
+        ),
+        thought_tokens=first_present_value(
+            data,
+            (
+                "thought_tokens",
+                "thoughts_token_count",
+                "thoughtsTokenCount",
+                "thinking_tokens",
+            ),
+        ),
+        tool_tokens=first_present_value(
+            data,
+            (
+                "tool_tokens",
+                "tool_token_count",
+                "toolUsePromptTokenCount",
+                "tool_use_prompt_token_count",
+            ),
+        ),
+    )
+
+
+def extract_nested_gemini_usage_metadata(payload: Any) -> Dict[str, int]:
+    candidates: List[Dict[str, Any]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for usage_key in ("usage_metadata", "usageMetadata", "usage"):
+                usage_value = value.get(usage_key)
+                if isinstance(usage_value, dict):
+                    candidates.append(usage_value)
+            if extract_usage_metadata_from_mapping(value):
+                candidates.append(value)
+            for nested_value in value.values():
+                visit(nested_value)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(payload)
+    for candidate in candidates:
+        usage = extract_usage_metadata_from_mapping(candidate)
+        if usage:
+            return usage
+    return {}
+
+
+def extract_gemini_usage_metadata_with_source(payload: Any) -> tuple[Dict[str, int], str]:
+    cli_stats_usage = extract_gemini_cli_stats_usage_metadata(payload)
+    if cli_stats_usage:
+        return cli_stats_usage, "gemini_cli_stats"
+    nested_usage = extract_nested_gemini_usage_metadata(payload)
+    if nested_usage:
+        return nested_usage, "usage_metadata"
+    return {}, "unavailable"
+
+
+def extract_gemini_usage_metadata(payload: Any) -> Dict[str, int]:
+    usage, _ = extract_gemini_usage_metadata_with_source(payload)
+    return usage
+
+
+def annotate_langsmith_model_run(
+    *,
+    model: str,
+    provider: str,
+    num_predict: int,
+    temperature: float,
+) -> None:
+    if _langsmith is None or not langsmith_tracing_configured():
+        return
+    get_current_run_tree = getattr(_langsmith, "get_current_run_tree", None)
+    if get_current_run_tree is None:
+        return
+    try:
+        run_tree = get_current_run_tree()
+    except Exception:
+        return
+    if run_tree is None:
+        return
+    try:
+        run_tree.add_metadata(
+            {
+                "ls_provider": provider,
+                "ls_model_name": normalize_model_name(model),
+                "ls_temperature": temperature,
+                "ls_max_tokens": num_predict,
+                "ls_invocation_params": {
+                    "model": normalize_model_name(model),
+                    "raw_model": model,
+                    "provider": provider,
+                },
+            }
+        )
+    except Exception:
+        return
+
+
+def resolve_bool_value(value: str | None, fallback: bool = False) -> bool:
+    if value is None or not str(value).strip():
+        return fallback
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "debug"}
+
+
+def langsmith_tracing_requested() -> bool:
+    router_value = os.environ.get(ROUTER_LANGSMITH_ENABLED_ENV_VAR)
+    if router_value is not None and router_value.strip():
+        return resolve_bool_value(router_value)
+    for env_name in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2"):
+        env_value = os.environ.get(env_name)
+        if env_value is not None and env_value.strip():
+            return resolve_bool_value(env_value)
+    return False
+
+
+def langsmith_tracing_forced_disabled() -> bool:
+    router_value = os.environ.get(ROUTER_LANGSMITH_ENABLED_ENV_VAR)
+    return router_value is not None and router_value.strip() and not resolve_bool_value(router_value)
+
+
+def langsmith_api_key_configured() -> bool:
+    return bool(
+        os.environ.get("LANGSMITH_API_KEY", "").strip()
+        or os.environ.get("LANGCHAIN_API_KEY", "").strip()
+    )
+
+
+def langsmith_tracing_configured() -> bool:
+    return _langsmith is not None and langsmith_tracing_requested() and langsmith_api_key_configured()
+
+
+def langsmith_project_name() -> str:
+    return (
+        os.environ.get(ROUTER_LANGSMITH_PROJECT_ENV_VAR, "").strip()
+        or os.environ.get("LANGSMITH_PROJECT", "").strip()
+        or "super-router"
+    )
+
+
+def parse_langsmith_tags() -> List[str]:
+    tags = ["super-router", "langgraph"]
+    raw_tags = os.environ.get(ROUTER_LANGSMITH_TAGS_ENV_VAR, "")
+    for raw_tag in raw_tags.split(","):
+        tag = raw_tag.strip()
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def build_langsmith_metadata(state: RouterState) -> Dict[str, Any]:
+    return {
+        "component": "super-router",
+        "run_id": state["run_id"],
+        "planner_model": state["planner_model"],
+        "judge_model": state["judge_model"],
+        "pro_model": state["pro_model"],
+        "flash_model": state["flash_model"],
+        "pro_fallback_count": len(state["pro_fallback_models"]),
+        "flash_fallback_count": len(state["flash_fallback_models"]),
+        "flash_retry_budget": state["flash_retry_budget"],
+        "task_chars": len(state["task"]),
+    }
+
+
+def process_langsmith_model_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    if resolve_bool("ROUTER_LANGSMITH_HIDE_INPUTS"):
+        return {}
+    args = inputs.get("args")
+    if not isinstance(args, (list, tuple)):
+        args = []
+    model = str(inputs.get("model") or (args[0] if len(args) > 0 else ""))
+    prompt = str(inputs.get("prompt") or (args[1] if len(args) > 1 else ""))
+    processed: Dict[str, Any] = {
+        "model": model,
+        "provider": langsmith_provider_name(model),
+        "transport": "gemini_cli" if is_gemini_model(model) else "ollama_http",
+        "timeout": inputs.get("timeout"),
+        "num_predict": inputs.get("num_predict"),
+        "temperature": inputs.get("temperature"),
+        "usage_label": inputs.get("usage_label", ""),
+        "prompt_chars": len(prompt),
+    }
+    if resolve_bool("ROUTER_LANGSMITH_TRACE_PROMPTS"):
+        processed["prompt_preview"] = compact_text(prompt, 1000)
+    return processed
+
+
+def process_langsmith_model_outputs(output: Any) -> Dict[str, Any]:
+    output_text = str(output.get("text", "")) if isinstance(output, dict) else str(output or "")
+    usage_metadata = (
+        output.get("usage_metadata", {})
+        if isinstance(output, dict) and isinstance(output.get("usage_metadata"), dict)
+        else {}
+    )
+    usage_source = str(output.get("usage_source", "")) if isinstance(output, dict) else ""
+    if resolve_bool("ROUTER_LANGSMITH_HIDE_OUTPUTS"):
+        processed_hidden: Dict[str, Any] = {}
+        if usage_metadata:
+            processed_hidden["usage_metadata"] = usage_metadata
+        if usage_source:
+            processed_hidden["usage_source"] = usage_source
+        return processed_hidden
+    processed: Dict[str, Any] = {"output_chars": len(output_text)}
+    if usage_metadata:
+        processed["usage_metadata"] = usage_metadata
+    if usage_source:
+        processed["usage_source"] = usage_source
+    if resolve_bool("ROUTER_LANGSMITH_TRACE_OUTPUTS"):
+        processed["output_preview"] = compact_text(output_text, 1000)
+    return processed
+
+
+def create_langsmith_client() -> Any | None:
+    if _langsmith is None:
+        return None
+    client_cls = getattr(_langsmith, "Client", None)
+    if client_cls is None:
+        return None
+    kwargs: Dict[str, Any] = {}
+    api_key = os.environ.get("LANGSMITH_API_KEY", "").strip() or os.environ.get("LANGCHAIN_API_KEY", "").strip()
+    endpoint = os.environ.get("LANGSMITH_ENDPOINT", "").strip() or os.environ.get("LANGCHAIN_ENDPOINT", "").strip()
+    workspace_id = os.environ.get("LANGSMITH_WORKSPACE_ID", "").strip()
+    if api_key:
+        kwargs["api_key"] = api_key
+    if endpoint:
+        kwargs["api_url"] = endpoint
+    if workspace_id:
+        kwargs["workspace_id"] = workspace_id
+    if resolve_bool("ROUTER_LANGSMITH_HIDE_INPUTS"):
+        kwargs["hide_inputs"] = True
+    if resolve_bool("ROUTER_LANGSMITH_HIDE_OUTPUTS"):
+        kwargs["hide_outputs"] = True
+    try:
+        return client_cls(**kwargs)
+    except Exception as exc:
+        print(f"[LangSmith] Failed to initialize client; continuing without telemetry: {compact_text(str(exc), 220)}")
+        return None
+
+
+@contextlib.contextmanager
+def langsmith_tracing_context(state: RouterState) -> Iterator[None]:
+    if langsmith_tracing_forced_disabled():
+        tracing_context = getattr(_langsmith, "tracing_context", None) if _langsmith is not None else None
+        if tracing_context is None:
+            yield
+        else:
+            with tracing_context(enabled=False):
+                yield
+        return
+    if not langsmith_tracing_requested():
+        yield
+        return
+    if _langsmith is None:
+        print("[LangSmith] Telemetry requested but the langsmith package is unavailable; continuing without tracing.")
+        yield
+        return
+    tracing_context = getattr(_langsmith, "tracing_context", None)
+    if tracing_context is None:
+        print("[LangSmith] Telemetry requested but tracing_context is unavailable; continuing without tracing.")
+        yield
+        return
+    if not langsmith_api_key_configured():
+        print("[LangSmith] Telemetry requested but LANGSMITH_API_KEY is not set; continuing without tracing.")
+        with tracing_context(enabled=False):
+            yield
+        return
+
+    client = create_langsmith_client()
+    context_kwargs: Dict[str, Any] = {
+        "enabled": True,
+        "project_name": langsmith_project_name(),
+        "tags": parse_langsmith_tags(),
+        "metadata": build_langsmith_metadata(state),
+    }
+    if client is not None:
+        context_kwargs["client"] = client
+    try:
+        with tracing_context(**context_kwargs):
+            yield
+    finally:
+        if client is not None and resolve_bool("ROUTER_LANGSMITH_FLUSH", True):
+            try:
+                client.flush()
+            except Exception as exc:
+                print(f"[LangSmith] Failed to flush traces: {compact_text(str(exc), 220)}")
+
+
+def empty_token_usage_summary() -> TokenUsageSummary:
+    return {
+        "calls": 0,
+        "calls_with_usage": 0,
+        "calls_without_usage": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_tokens": 0,
+        "candidate_tokens": 0,
+        "thought_tokens": 0,
+        "tool_tokens": 0,
+        "by_model": {},
+        "by_provider": {},
+    }
+
+
+def current_token_usage_run_id() -> str:
+    run_id = TOKEN_USAGE_RUN_ID.get("")
+    if run_id:
+        return run_id
+    with TOKEN_USAGE_LOCK:
+        if len(TOKEN_USAGE_ACTIVE_RUN_IDS) == 1:
+            return next(iter(TOKEN_USAGE_ACTIVE_RUN_IDS))
+    return ""
+
+
+@contextlib.contextmanager
+def token_usage_tracking_context(run_id: str) -> Iterator[None]:
+    token = TOKEN_USAGE_RUN_ID.set(run_id)
+    with TOKEN_USAGE_LOCK:
+        TOKEN_USAGE_RECORDS_BY_RUN[run_id] = []
+        TOKEN_USAGE_ACTIVE_RUN_IDS.add(run_id)
+    try:
+        yield
+    finally:
+        TOKEN_USAGE_RUN_ID.reset(token)
+        with TOKEN_USAGE_LOCK:
+            TOKEN_USAGE_ACTIVE_RUN_IDS.discard(run_id)
+
+
+def get_token_usage_records(run_id: str) -> List[TokenUsageRecord]:
+    with TOKEN_USAGE_LOCK:
+        return list(TOKEN_USAGE_RECORDS_BY_RUN.get(run_id, []))
+
+
+def resolve_token_usage_ledger_path() -> str:
+    return os.path.expanduser(os.environ.get(ROUTER_TOKEN_USAGE_LEDGER_ENV_VAR, "").strip())
+
+
+def persist_token_usage_ledger(
+    records: List[TokenUsageRecord],
+    summary: TokenUsageSummary,
+    *,
+    state: RouterState,
+) -> str:
+    ledger_path = resolve_token_usage_ledger_path()
+    if not ledger_path or not records:
+        return ""
+
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    ledger_dir = os.path.dirname(ledger_path)
+    if ledger_dir:
+        os.makedirs(ledger_dir, exist_ok=True)
+
+    base_event = {
+        "event": "token_usage",
+        "schema_version": 1,
+        "timestamp": timestamp,
+        "run_id": state["run_id"],
+        "task_chars": len(state["task"]),
+        "status": state["status"],
+        "planner_model": state["planner_model"],
+        "judge_model": state["judge_model"],
+        "pro_model": state["pro_model"],
+        "flash_model": state["flash_model"],
+        "summary": summary,
+    }
+    with open(ledger_path, "a", encoding="utf-8") as ledger_file:
+        for record in records:
+            event = dict(base_event)
+            event["record"] = record
+            ledger_file.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    return ledger_path
+
+
+def metric_value(record: TokenUsageRecord, key: str) -> int:
+    return int(record.get(key, 0) or 0)
+
+
+def add_usage_to_bucket(bucket: Dict[str, int], record: TokenUsageRecord) -> None:
+    bucket["calls"] = bucket.get("calls", 0) + 1
+    if metric_value(record, "total_tokens") > 0:
+        bucket["calls_with_usage"] = bucket.get("calls_with_usage", 0) + 1
+    else:
+        bucket["calls_without_usage"] = bucket.get("calls_without_usage", 0) + 1
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cached_tokens",
+        "candidate_tokens",
+        "thought_tokens",
+        "tool_tokens",
+    ):
+        bucket[key] = bucket.get(key, 0) + metric_value(record, key)
+
+
+def summarize_token_usage_records(records: List[TokenUsageRecord]) -> TokenUsageSummary:
+    summary = empty_token_usage_summary()
+    for record in records:
+        add_usage_to_bucket(summary, record)
+        model_name = record["model_name"] or "unknown"
+        provider = record["provider"] or "unknown"
+        model_bucket = summary["by_model"].setdefault(model_name, {})
+        provider_bucket = summary["by_provider"].setdefault(provider, {})
+        add_usage_to_bucket(model_bucket, record)
+        add_usage_to_bucket(provider_bucket, record)
+    return summary
+
+
+def format_int(value: int) -> str:
+    return f"{value:,}"
+
+
+def format_token_usage_summary(summary: TokenUsageSummary) -> str:
+    if summary["calls"] == 0:
+        return "Token Usage Summary\n- Calls: 0 (no provider token usage captured)."
+    lines = [
+        "Token Usage Summary",
+        (
+            f"- Calls: {summary['calls']} "
+            f"({summary['calls_with_usage']} with token counts, "
+            f"{summary['calls_without_usage']} unavailable)"
+        ),
+        (
+            "- Tokens: "
+            f"input={format_int(summary['input_tokens'])}, "
+            f"output={format_int(summary['output_tokens'])}, "
+            f"total={format_int(summary['total_tokens'])}"
+        ),
+    ]
+    extras: List[str] = []
+    if summary["cached_tokens"]:
+        extras.append(f"cached={format_int(summary['cached_tokens'])}")
+    if summary["candidate_tokens"]:
+        extras.append(f"candidates={format_int(summary['candidate_tokens'])}")
+    if summary["thought_tokens"]:
+        extras.append(f"thoughts={format_int(summary['thought_tokens'])}")
+    if summary["tool_tokens"]:
+        extras.append(f"tool={format_int(summary['tool_tokens'])}")
+    if extras:
+        lines.append("- Extra tokens: " + ", ".join(extras))
+    if summary["by_model"]:
+        lines.append("- By model:")
+        for model_name, bucket in sorted(summary["by_model"].items()):
+            lines.append(
+                f"  - {model_name}: calls={bucket.get('calls', 0)}, "
+                f"total={format_int(bucket.get('total_tokens', 0))}, "
+                f"input={format_int(bucket.get('input_tokens', 0))}, "
+                f"output={format_int(bucket.get('output_tokens', 0))}"
+            )
+    return "\n".join(lines)
+
+
+def record_token_usage(
+    result: TextGenerationResult,
+    *,
+    label: str,
+    prompt: str,
+) -> None:
+    run_id = current_token_usage_run_id()
+    if not run_id:
+        return
+    usage = result.get("usage_metadata", {})
+    if not isinstance(usage, dict):
+        usage = {}
+    output_text = str(result.get("text", ""))
+    record: TokenUsageRecord = {
+        "run_id": run_id,
+        "call_index": 0,
+        "label": label,
+        "provider": str(result.get("provider", "")),
+        "model_name": str(result.get("model_name", "")),
+        "usage_source": str(result.get("usage_source", "unavailable")),
+        "input_tokens": int(usage.get("input_tokens", 0) or 0),
+        "output_tokens": int(usage.get("output_tokens", 0) or 0),
+        "total_tokens": int(usage.get("total_tokens", 0) or 0),
+        "cached_tokens": int(usage.get("cached_tokens", 0) or 0),
+        "candidate_tokens": int(usage.get("candidate_tokens", 0) or 0),
+        "thought_tokens": int(usage.get("thought_tokens", 0) or 0),
+        "tool_tokens": int(usage.get("tool_tokens", 0) or 0),
+        "prompt_chars": len(prompt),
+        "output_chars": len(output_text),
+    }
+    with TOKEN_USAGE_LOCK:
+        records = TOKEN_USAGE_RECORDS_BY_RUN.setdefault(run_id, [])
+        record["call_index"] = len(records) + 1
+        records.append(record)
+
+
 def has_proxy_config() -> bool:
     return any(
         os.environ.get(name, "").strip()
@@ -1158,14 +1892,14 @@ def ensure_gemini_network_ready(timeout: float = 3.0) -> None:
     GEMINI_NETWORK_PREFLIGHT_RESULT = ""
 
 
-def ollama_generate(
+def ollama_generate_with_usage(
     model: str,
     prompt: str,
     *,
     timeout: int = 60,
     num_predict: int = 400,
     temperature: float = 0.0,
-) -> str:
+) -> TextGenerationResult:
     # Increase num_predict for large models (e.g. gemma4:26b) to allow full JSON responses
     # Large models need more tokens for structured output like JSON
     if "gemma4" in model.lower() and num_predict < 204800:
@@ -1213,7 +1947,30 @@ def ollama_generate(
     text = str(data.get("response", "")).strip()
     if not text:
         raise RuntimeError(f"Ollama returned an empty response for model {model}")
-    return text
+    return build_text_generation_result(
+        text,
+        extract_ollama_usage_metadata(data),
+        "ollama",
+        model,
+        "ollama_generate",
+    )
+
+
+def ollama_generate(
+    model: str,
+    prompt: str,
+    *,
+    timeout: int = 60,
+    num_predict: int = 400,
+    temperature: float = 0.0,
+) -> str:
+    return ollama_generate_with_usage(
+        model,
+        prompt,
+        timeout=timeout,
+        num_predict=num_predict,
+        temperature=temperature,
+    )["text"]
 
 
 def default_gemini_system_settings_path() -> str:
@@ -1267,13 +2024,13 @@ def build_gemini_temperature_settings(normalized_model: str, temperature: float)
     return settings
 
 
-def invoke_gemini_cli(
+def invoke_gemini_cli_with_usage(
     model: str,
     prompt: str,
     *,
     timeout: int = 120,
     temperature: float = 0.0,
-) -> str:
+) -> TextGenerationResult:
     normalized_model = normalize_model_name(model)
     if not GEMINI_CLI_PATH or not os.path.exists(GEMINI_CLI_PATH):
         raise RuntimeError("Gemini CLI executable was not found. Set ROUTER_GEMINI_CLI or install `gemini`.")
@@ -1373,12 +2130,40 @@ def invoke_gemini_cli(
         if error_text and not any(w.lower() in error_text.lower() for w in BENIGN_WARNINGS):
             raise RuntimeError(f"Gemini CLI returned an error for model {normalized_model}: {error_text}")
 
+    usage_metadata, usage_source = extract_gemini_usage_metadata_with_source(parsed_payload or {})
     if parsed_payload and str(parsed_payload.get("response", "")).strip():
-        return str(parsed_payload["response"]).strip()
+        return build_text_generation_result(
+            str(parsed_payload["response"]).strip(),
+            usage_metadata,
+            "google_genai",
+            normalized_model,
+            usage_source,
+        )
 
     if not payload_text:
         raise RuntimeError(f"Gemini CLI returned an empty response for model {normalized_model}")
-    return payload_text
+    return build_text_generation_result(
+        payload_text,
+        usage_metadata,
+        "google_genai",
+        normalized_model,
+        usage_source,
+    )
+
+
+def invoke_gemini_cli(
+    model: str,
+    prompt: str,
+    *,
+    timeout: int = 120,
+    temperature: float = 0.0,
+) -> str:
+    return invoke_gemini_cli_with_usage(
+        model,
+        prompt,
+        timeout=timeout,
+        temperature=temperature,
+    )["text"]
 
 
 def ensure_gemini_cli_ready(model: str) -> None:
@@ -1406,8 +2191,67 @@ def gemini_generate(
     timeout: int = 120,
     temperature: float = 0.0,
 ) -> str:
+    return gemini_generate_with_usage(
+        model,
+        prompt,
+        timeout=timeout,
+        temperature=temperature,
+    )["text"]
+
+
+def gemini_generate_with_usage(
+    model: str,
+    prompt: str,
+    *,
+    timeout: int = 120,
+    temperature: float = 0.0,
+) -> TextGenerationResult:
     ensure_gemini_cli_ready(model)
-    return invoke_gemini_cli(model, prompt, timeout=timeout, temperature=temperature)
+    return invoke_gemini_cli_with_usage(model, prompt, timeout=timeout, temperature=temperature)
+
+
+def _execute_generate_text_with_usage(
+    model: str,
+    prompt: str,
+    *,
+    timeout: int = 60,
+    num_predict: int = 400,
+    temperature: float = 0.0,
+    usage_label: str = "",
+) -> TextGenerationResult:
+    provider = langsmith_provider_name(model)
+    annotate_langsmith_model_run(
+        model=model,
+        provider=provider,
+        num_predict=num_predict,
+        temperature=temperature,
+    )
+    if is_gemini_model(model):
+        return gemini_generate_with_usage(model, prompt, timeout=timeout, temperature=temperature)
+    return ollama_generate_with_usage(
+        model,
+        prompt,
+        timeout=timeout,
+        num_predict=num_predict,
+        temperature=temperature,
+    )
+
+
+if _langsmith is not None and getattr(_langsmith, "traceable", None) is not None:
+    _traced_generate_text = _langsmith.traceable(
+        name="Super Router Model Call",
+        run_type="llm",
+        process_inputs=process_langsmith_model_inputs,
+        process_outputs=process_langsmith_model_outputs,
+    )(_execute_generate_text_with_usage)
+else:
+    _traced_generate_text = _execute_generate_text_with_usage
+
+
+def unwrap_text_generation_result(result: Any) -> str:
+    if isinstance(result, dict) and "text" in result:
+        return str(result["text"])
+    return str(result)
 
 
 def generate_text(
@@ -1417,16 +2261,38 @@ def generate_text(
     timeout: int = 60,
     num_predict: int = 400,
     temperature: float = 0.0,
+    usage_label: str = "",
 ) -> str:
-    if is_gemini_model(model):
-        return gemini_generate(model, prompt, timeout=timeout, temperature=temperature)
-    return ollama_generate(
+    if langsmith_tracing_configured():
+        result = _traced_generate_text(
+            model,
+            prompt,
+            timeout=timeout,
+            num_predict=num_predict,
+            temperature=temperature,
+            usage_label=usage_label,
+        )
+        if isinstance(result, dict):
+            record_token_usage(
+                result,
+                label=usage_label or normalize_model_name(model),
+                prompt=prompt,
+            )
+        return unwrap_text_generation_result(result)
+    result = _execute_generate_text_with_usage(
         model,
         prompt,
         timeout=timeout,
         num_predict=num_predict,
         temperature=temperature,
+        usage_label=usage_label,
     )
+    record_token_usage(
+        result,
+        label=usage_label or normalize_model_name(model),
+        prompt=prompt,
+    )
+    return unwrap_text_generation_result(result)
 
 
 def extract_first_json_array(text: str) -> List[Any]:
@@ -1892,6 +2758,7 @@ def score_subtask_with_model(task: str, subtask_desc: str, judge_model: str) -> 
         build_judge_prompt(task, subtask_desc),
         timeout=judge_timeout,
         num_predict=204800,  # Increased for full JSON object output from large models
+        usage_label=f"Judge subtask: {compact_text(subtask_desc, 80)}",
     )
     if router_debug_enabled():
         print(f"\n[DEBUG Judge Output for: {subtask_desc[:60]}...]")
@@ -1941,7 +2808,13 @@ def planner_warmup_node(state: RouterState) -> Dict[str, Any]:
     if attempt == 1:
         print("\n[Node: Planner Warmup] 🔥 Warming up planner model with a LangGraph loop...")
     try:
-        generate_text(state["planner_model"], "OK", timeout=300, num_predict=4)
+        generate_text(
+            state["planner_model"],
+            "OK",
+            timeout=300,
+            num_predict=4,
+            usage_label=f"Planner warmup {attempt}",
+        )
         print(f"[Planner Warmup] ✅ Ping {attempt}/3 successful")
     except Exception as exc:
         print(f"[Planner Warmup] ⚠️ Ping {attempt}/3 failed: {exc}")
@@ -1965,6 +2838,7 @@ def planner_invoke_node(state: RouterState) -> Dict[str, Any]:
             build_planner_prompt(state["task"]),
             timeout=300,  # 5 minutes for large models like gemma4:26b
             num_predict=409600,  # Increased for full JSON array output from large models
+            usage_label="Planner invoke",
         )
         return {
             "planner_raw_text": raw_text,
@@ -2049,7 +2923,13 @@ def judge_warmup_node(state: RouterState) -> Dict[str, Any]:
         return {"judge_warmup_done": True, "status": "judge_warmup_skipped"}
     print("\n[Node: Judge Warmup] 🔥 Warming up judge model before LangGraph fanout...")
     try:
-        generate_text(state["judge_model"], "OK", timeout=300, num_predict=4)
+        generate_text(
+            state["judge_model"],
+            "OK",
+            timeout=300,
+            num_predict=4,
+            usage_label="Judge warmup",
+        )
         print("[Judge Warmup] ✅ Warmup successful")
         return {
             "judge_warmup_done": True,
@@ -3195,12 +4075,32 @@ def deterministic_finalizer_node(state: RouterState) -> RouterState:
 
 
 def finalizer_complete_node(state: RouterState) -> RouterState:
+    token_usage = get_token_usage_records(state["run_id"])
+    token_usage_summary = summarize_token_usage_records(token_usage)
+    token_usage_history: List[str] = ["Finalizer completed."]
     print("\n" + "=" * 58)
     print(state["final_report"])
+    print("-" * 58)
+    print(format_token_usage_summary(token_usage_summary))
+    try:
+        ledger_path = persist_token_usage_ledger(
+            token_usage,
+            token_usage_summary,
+            state=state,
+        )
+        if ledger_path:
+            print(f"- Ledger: {ledger_path}")
+            token_usage_history.append(f"Token usage ledger appended: {ledger_path}")
+    except Exception as exc:
+        error_text = compact_text(str(exc), 220)
+        print(f"- Ledger write failed: {error_text}")
+        token_usage_history.append(f"Token usage ledger write failed: {error_text}")
     print("=" * 58)
 
     return {
-        "history": ["Finalizer completed."],
+        "history": token_usage_history,
+        "token_usage": token_usage,
+        "token_usage_summary": token_usage_summary,
         "status": "finished",
     }
 
@@ -3293,10 +4193,18 @@ def resolve_graph_max_concurrency(explicit_value: int | None, state: RouterState
     return None
 
 
-def build_graph_config(recursion_limit: int, max_concurrency: int | None = None) -> Dict[str, int]:
-    config = {"recursion_limit": recursion_limit}
+def build_graph_config(
+    recursion_limit: int,
+    max_concurrency: int | None = None,
+    state: RouterState | None = None,
+) -> Dict[str, Any]:
+    config: Dict[str, Any] = {"recursion_limit": recursion_limit}
     if max_concurrency is not None:
         config["max_concurrency"] = max_concurrency
+    if state is not None:
+        config["run_name"] = "super-router"
+        config["tags"] = parse_langsmith_tags()
+        config["metadata"] = build_langsmith_metadata(state)
     return config
 
 
@@ -3362,6 +4270,7 @@ def create_initial_state(
         DEFAULT_FLASH_RETRY_BUDGET,
     )
     return {
+        "run_id": str(uuid.uuid4()),
         "task": task,
         "planner_model": resolved_planner,
         "judge_model": resolved_judge,
@@ -3406,6 +4315,8 @@ def create_initial_state(
         "finalizer_error": "",
         "finalizer_flash_reason": "",
         "finalizer_invocation_result": empty_model_invocation_result(),
+        "token_usage": [],
+        "token_usage_summary": empty_token_usage_summary(),
     }
 
 
@@ -3510,24 +4421,30 @@ def run_router_app(
         recursion_limit=recursion_limit,
         max_concurrency=max_concurrency,
     )
-    graph_config = build_graph_config(resolved_recursion_limit, resolved_max_concurrency)
+    graph_config = build_graph_config(
+        resolved_recursion_limit,
+        resolved_max_concurrency,
+        initial_state,
+    )
     if resolved_max_concurrency == 1 and is_large_model(initial_state["judge_model"]):
         print("[LangGraph Config] Large Judge model detected; max_concurrency=1 to avoid local model contention.")
-    if not stream:
-        return graph.invoke(
-            initial_state,
-            config=graph_config,
-        )
+    with token_usage_tracking_context(initial_state["run_id"]):
+        with langsmith_tracing_context(initial_state):
+            if not stream:
+                return graph.invoke(
+                    initial_state,
+                    config=graph_config,
+                )
 
-    print("\n[LangGraph Stream] 🔄 节点级流式输出已启用。")
-    final_state: RouterState = initial_state
-    for event in graph.stream(
-        initial_state,
-        config=graph_config,
-        stream_mode=["updates", "values"],
-    ):
-        final_state = observe_stream_event(event, final_state=final_state)
-    return final_state
+            print("\n[LangGraph Stream] 🔄 节点级流式输出已启用。")
+            final_state: RouterState = initial_state
+            for event in graph.stream(
+                initial_state,
+                config=graph_config,
+                stream_mode=["updates", "values"],
+            ):
+                final_state = observe_stream_event(event, final_state=final_state)
+            return final_state
 
 
 def parse_cli_args(argv: List[str]) -> argparse.Namespace:

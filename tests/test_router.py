@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -41,6 +42,122 @@ class RouterHelperTests(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {"ROUTER_DEBUG": "yes"}, clear=False):
             self.assertTrue(r.router_debug_enabled())
+
+    def test_langsmith_config_metadata_and_tags(self):
+        state = r.create_initial_state(
+            "Trace this router run",
+            planner_model="planner",
+            judge_model="judge",
+            pro_model="pro",
+            flash_model="flash",
+            pro_fallback_models=["pro2"],
+            flash_retry_budget=2,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"ROUTER_LANGSMITH_TAGS": "local,ci"},
+            clear=False,
+        ):
+            config = r.build_graph_config(42, 1, state)
+
+        self.assertEqual(config["recursion_limit"], 42)
+        self.assertEqual(config["max_concurrency"], 1)
+        self.assertEqual(config["run_name"], "super-router")
+        self.assertEqual(config["tags"], ["super-router", "langgraph", "local", "ci"])
+        self.assertEqual(config["metadata"]["planner_model"], "planner")
+        self.assertEqual(config["metadata"]["judge_model"], "judge")
+        self.assertEqual(config["metadata"]["pro_fallback_count"], 1)
+        self.assertEqual(config["metadata"]["flash_retry_budget"], 2)
+        self.assertEqual(config["metadata"]["task_chars"], len("Trace this router run"))
+
+    def test_langsmith_model_trace_processors_hide_text_by_default(self):
+        inputs = {
+            "model": "google-gemini-cli/gemini-3-flash-preview",
+            "prompt": "sensitive prompt body",
+            "timeout": 12,
+            "num_predict": 34,
+            "temperature": 0.5,
+        }
+        with mock.patch.dict(
+            os.environ,
+            {"ROUTER_LANGSMITH_TRACE_PROMPTS": "", "ROUTER_LANGSMITH_TRACE_OUTPUTS": ""},
+            clear=False,
+        ):
+            processed = r.process_langsmith_model_inputs(inputs)
+
+        self.assertEqual(processed["provider"], "google_genai")
+        self.assertEqual(processed["transport"], "gemini_cli")
+        self.assertEqual(processed["prompt_chars"], len("sensitive prompt body"))
+        self.assertNotIn("sensitive prompt body", str(processed))
+
+        with mock.patch.dict(
+            os.environ,
+            {"ROUTER_LANGSMITH_TRACE_PROMPTS": "true", "ROUTER_LANGSMITH_TRACE_OUTPUTS": ""},
+            clear=False,
+        ):
+            processed_with_preview = r.process_langsmith_model_inputs(inputs)
+
+        self.assertIn("sensitive prompt body", processed_with_preview["prompt_preview"])
+        self.assertEqual(
+            r.process_langsmith_model_outputs("model output"),
+            {"output_chars": len("model output")},
+        )
+        output_with_usage = {
+            "text": "model output",
+            "usage_metadata": {
+                "input_tokens": 3,
+                "output_tokens": 4,
+                "total_tokens": 7,
+            },
+        }
+        self.assertEqual(
+            r.process_langsmith_model_outputs(output_with_usage),
+            {
+                "output_chars": len("model output"),
+                "usage_metadata": {
+                    "input_tokens": 3,
+                    "output_tokens": 4,
+                    "total_tokens": 7,
+                },
+            },
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"ROUTER_LANGSMITH_HIDE_INPUTS": "1", "ROUTER_LANGSMITH_HIDE_OUTPUTS": "1"},
+            clear=False,
+        ):
+            self.assertEqual(r.process_langsmith_model_inputs(inputs), {})
+            self.assertEqual(
+                r.process_langsmith_model_outputs(output_with_usage),
+                {
+                    "usage_metadata": {
+                        "input_tokens": 3,
+                        "output_tokens": 4,
+                        "total_tokens": 7,
+                    },
+                },
+            )
+
+    def test_langsmith_request_and_configuration_flags(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(r.langsmith_tracing_requested())
+            self.assertFalse(r.langsmith_api_key_configured())
+
+        with mock.patch.dict(
+            os.environ,
+            {"ROUTER_LANGSMITH_ENABLED": "true", "LANGSMITH_API_KEY": "test-key"},
+            clear=True,
+        ):
+            self.assertTrue(r.langsmith_tracing_requested())
+            self.assertTrue(r.langsmith_api_key_configured())
+
+        with mock.patch.dict(
+            os.environ,
+            {"ROUTER_LANGSMITH_ENABLED": "false", "LANGSMITH_TRACING": "true", "LANGSMITH_API_KEY": "test-key"},
+            clear=True,
+        ):
+            self.assertFalse(r.langsmith_tracing_requested())
+            self.assertTrue(r.langsmith_tracing_forced_disabled())
 
     def test_json_extraction_and_planner_normalization(self):
         self.assertEqual(r.extract_first_json_array("prefix [{\"desc\":\"A\"}] suffix"), [{"desc": "A"}])
@@ -86,9 +203,9 @@ class RouterHelperTests(unittest.TestCase):
 
         def fake_gemini(model, prompt, *, timeout, temperature):
             captured.append((model, prompt, timeout, temperature))
-            return "ok"
+            return r.build_text_generation_result("ok", {}, "google_genai", model)
 
-        with mock.patch.object(r, "gemini_generate", side_effect=fake_gemini):
+        with mock.patch.object(r, "gemini_generate_with_usage", side_effect=fake_gemini):
             self.assertEqual(
                 r.generate_text("google-gemini-cli/flash", "prompt", timeout=30, temperature=0.2),
                 "ok",
@@ -101,12 +218,16 @@ class RouterHelperTests(unittest.TestCase):
 
         class FakeResult:
             returncode = 0
-            stdout = '{"response": "ok"}'
+            stdout = (
+                '{"response": "ok", '
+                '"usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 4, "totalTokenCount": 7}}'
+            )
             stderr = ""
 
-        def fake_run(command, *, capture_output, text, timeout, env, check):
+        def fake_run(command, *, capture_output, text, timeout, env, check, stdin):
             captured["command"] = command
             captured["timeout"] = timeout
+            captured["stdin"] = stdin
             with open(env[r.GEMINI_SYSTEM_SETTINGS_ENV_VAR], "r", encoding="utf-8") as settings_file:
                 captured["settings"] = json.load(settings_file)
             return FakeResult()
@@ -117,21 +238,166 @@ class RouterHelperTests(unittest.TestCase):
             mock.patch.dict(os.environ, {r.GEMINI_SYSTEM_SETTINGS_ENV_VAR: ""}, clear=False),
             mock.patch.object(r.subprocess, "run", side_effect=fake_run),
         ):
-            self.assertEqual(
-                r.invoke_gemini_cli(
-                    "google-gemini-cli/gemini-3-pro-preview",
-                    "prompt",
-                    timeout=30,
-                    temperature=0.0,
-                ),
-                "ok",
+            result = r.invoke_gemini_cli_with_usage(
+                "google-gemini-cli/gemini-3-pro-preview",
+                "prompt",
+                timeout=30,
+                temperature=0.0,
             )
 
+        self.assertEqual(result["text"], "ok")
+        self.assertEqual(
+            result["usage_metadata"],
+            {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7, "candidate_tokens": 4},
+        )
         override = captured["settings"]["modelConfigs"]["customOverrides"][-1]
         self.assertEqual(captured["command"][2], "gemini-3-pro-preview")
         self.assertEqual(captured["timeout"], 30)
+        self.assertEqual(captured["stdin"], r.subprocess.DEVNULL)
         self.assertEqual(override["match"], {"model": "gemini-3-pro-preview"})
         self.assertEqual(override["modelConfig"]["generateContentConfig"]["temperature"], 0.0)
+
+    def test_provider_usage_metadata_extraction(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "response": "ollama output",
+                        "prompt_eval_count": 5,
+                        "eval_count": 6,
+                    }
+                ).encode("utf-8")
+
+        with mock.patch.object(r.urllib.request, "urlopen", return_value=FakeResponse()):
+            result = r.ollama_generate_with_usage("llama3.1:8b", "prompt", timeout=1)
+
+        self.assertEqual(result["text"], "ollama output")
+        self.assertEqual(
+            result["usage_metadata"],
+            {"input_tokens": 5, "output_tokens": 6, "total_tokens": 11},
+        )
+        self.assertEqual(
+            r.extract_gemini_usage_metadata(
+                {"nested": {"usageMetadata": {"promptTokenCount": 2, "totalTokenCount": 9}}}
+            ),
+            {"input_tokens": 2, "output_tokens": 7, "total_tokens": 9},
+        )
+        self.assertEqual(
+            r.extract_gemini_usage_metadata(
+                {
+                    "stats": {
+                        "models": {
+                            "gemini-3-pro-preview": {
+                                "tokens": {
+                                    "prompt": 10,
+                                    "candidates": 3,
+                                    "thoughts": 2,
+                                    "cached": 4,
+                                    "tool": 1,
+                                    "total": 16,
+                                }
+                            }
+                        }
+                    }
+                }
+            ),
+            {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 16,
+                "cached_tokens": 4,
+                "thought_tokens": 2,
+                "tool_tokens": 1,
+                "candidate_tokens": 3,
+            },
+        )
+
+    def test_token_usage_tracking_records_generate_text_calls(self):
+        def fake_gemini(model, prompt, *, timeout, temperature):
+            return r.build_text_generation_result(
+                "tracked output",
+                {"input_tokens": 8, "output_tokens": 5, "total_tokens": 13},
+                "google_genai",
+                model,
+                "gemini_cli_stats",
+            )
+
+        with r.token_usage_tracking_context("test-token-run"):
+            with mock.patch.object(r, "gemini_generate_with_usage", side_effect=fake_gemini):
+                self.assertEqual(
+                    r.generate_text(
+                        "google-gemini-cli/gemini-3-pro-preview",
+                        "tracked prompt",
+                        timeout=30,
+                        usage_label="Planner invoke",
+                    ),
+                    "tracked output",
+                )
+
+        records = r.get_token_usage_records("test-token-run")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["label"], "Planner invoke")
+        self.assertEqual(records[0]["usage_source"], "gemini_cli_stats")
+        self.assertEqual(records[0]["input_tokens"], 8)
+        self.assertEqual(records[0]["output_tokens"], 5)
+        self.assertEqual(records[0]["total_tokens"], 13)
+
+        summary = r.summarize_token_usage_records(records)
+        self.assertEqual(summary["calls"], 1)
+        self.assertEqual(summary["calls_with_usage"], 1)
+        self.assertEqual(summary["by_model"]["google-gemini-cli/gemini-3-pro-preview"]["total_tokens"], 13)
+
+    def test_token_usage_ledger_persistence_jsonl(self):
+        state = r.create_initial_state(
+            "Persist usage",
+            planner_model="planner",
+            judge_model="judge",
+            pro_model="pro",
+            flash_model="flash",
+        )
+        state["run_id"] = "ledger-run"
+        records = [
+            {
+                "run_id": "ledger-run",
+                "call_index": 1,
+                "label": "Planner invoke",
+                "provider": "google_genai",
+                "model_name": "gemini-3-pro-preview",
+                "usage_source": "gemini_cli_stats",
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "total_tokens": 15,
+                "cached_tokens": 3,
+                "candidate_tokens": 4,
+                "thought_tokens": 1,
+                "tool_tokens": 0,
+                "prompt_chars": 20,
+                "output_chars": 30,
+            }
+        ]
+        summary = r.summarize_token_usage_records(records)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger_path = os.path.join(temp_dir, "usage.jsonl")
+            with mock.patch.dict(os.environ, {r.ROUTER_TOKEN_USAGE_LEDGER_ENV_VAR: ledger_path}, clear=False):
+                written_path = r.persist_token_usage_ledger(records, summary, state=state)
+
+            self.assertEqual(written_path, ledger_path)
+            with open(ledger_path, "r", encoding="utf-8") as ledger_file:
+                lines = ledger_file.readlines()
+
+        self.assertEqual(len(lines), 1)
+        event = json.loads(lines[0])
+        self.assertEqual(event["event"], "token_usage")
+        self.assertEqual(event["run_id"], "ledger-run")
+        self.assertEqual(event["summary"]["total_tokens"], 15)
+        self.assertEqual(event["record"]["label"], "Planner invoke")
 
     def test_stream_event_helpers(self):
         mode, payload = r.unpack_stream_event(("namespace", "updates", {"node": {"status": "done"}}))
