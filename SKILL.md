@@ -169,6 +169,16 @@ state. Calls without provider token data are recorded as
 `ROUTER_TOKEN_USAGE_LEDGER=~/.hermes/super-router-usage.jsonl` to persist the
 per-call records as append-only JSONL.
 
+If a super-router process stops before the final token ledger is printed, Gemini
+CLI may still have persisted exact per-call token records in
+`~/.gemini/tmp/<user>/chats/session-*.jsonl`. This applies to planning-capture
+termination, timeouts, manual kills, crashes, executor fanout interruptions, and
+metadata/finalizer failures. Use `references/gemini-cli-token-recovery.md` to
+recover `input`, `output`, `cached`, `thoughts`, `tool`, and `total` fields from
+matching session JSONL files. Treat recovered values as provider telemetry;
+treat dollar cost separately because cached-token billing depends on provider
+pricing.
+
 ## Complexity Routing Rules
 
 ### 5-Dimension Scoring
