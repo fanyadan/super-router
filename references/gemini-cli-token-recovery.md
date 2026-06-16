@@ -47,8 +47,9 @@ For a run, filter by the router capture time window. Each relevant JSONL often c
 ## Procedure
 
 1. Determine the router process start/stop window from available evidence: wrapper JSON, terminal/process timestamps, router logs, output artifact mtimes, or shell history.
-2. Read router artifacts for phase/model context: planner, judge, pro, flash, metadata extractor, and finalizer models when available.
-3. List Gemini CLI session files around that time:
+2. Normalize the time window carefully. Gemini CLI `session-*.jsonl` filenames may align with UTC-like timestamps while terminal `date` output or user-facing run logs may be local time. If an initial local-time search finds zero token records, retry using the UTC timestamp from the run artifact.
+3. Read router artifacts for phase/model context: planner, judge, pro, flash, metadata extractor, and finalizer models when available.
+4. List Gemini CLI session files around that time:
 
 ```bash
 ls -lt ~/.gemini/tmp/$USER/chats/session-YYYY-MM-DDTHH-*.jsonl
