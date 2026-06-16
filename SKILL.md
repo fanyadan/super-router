@@ -299,6 +299,7 @@ FLASH finalizer -> (if fails) -> PRO finalizer -> (if fails) -> Deterministic te
 |------|---------|
 | `scripts/router.py` | Main LangGraph router script |
 | `SKILL.md` | This documentation |
+| `references/long-running-quantitative-tasks.md` | Guidance for heavy Monte Carlo / financial modeling tasks and background execution |
 
 ## Troubleshooting
 
