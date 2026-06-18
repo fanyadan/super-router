@@ -107,6 +107,17 @@ process(action="poll", session_id="<session_id_from_exec>")
 process(action="wait", session_id="<session_id_from_exec>", timeout=300)
 ```
 
+For background launches requested by the user, use `terminal(background=true, notify_on_complete=true)` and verify the process is actually running with an immediate `process(action="poll")`. If a background router launch exits immediately, inspect the preview and relaunch with the fix rather than reporting success.
+
+For complex or multiline `ROUTER_TASK` prompts, avoid fragile inline heredocs inside `zsh -lic`. Write the task to a prompt file first, then launch with:
+
+```bash
+export ROUTER_TASK="$(/bin/cat "$HOME/.hermes/logs/<task-name>.txt")"
+/opt/homebrew/Caskroom/miniforge/base/bin/python "$HOME/.hermes/skills/mlops/inference/super-router/scripts/router.py" --stream 2>&1 | tee "$HOME/.hermes/logs/<task-name>.log"
+```
+
+This preserves quotes/apostrophes in the task, keeps an auditable prompt artifact, and avoids zsh parse failures from nested heredocs.
+
 **Important:** Once process shows completion, your next assistant message MUST start with `Router result:` or `Router failed:` and include at least one real detail from the output (e.g., "Planner fallback", "timeout", "BTC"). Never reply with just `---`, punctuation, or empty lines.
 
 ## Environment Variables
