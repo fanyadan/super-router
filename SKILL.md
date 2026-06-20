@@ -120,6 +120,16 @@ This preserves quotes/apostrophes in the task, keeps an auditable prompt artifac
 
 **Important:** Once process shows completion, your next assistant message MUST start with `Router result:` or `Router failed:` and include at least one real detail from the output (e.g., "Planner fallback", "timeout", "BTC"). Never reply with just `---`, punctuation, or empty lines.
 
+### Post-Completion Artifact Verification
+
+For router runs that create or modify artifacts (reports, JSON logs, database ingests, generated files), do not trust the router final stdout alone. Before reporting success to the user:
+
+1. Inspect the declared output artifacts directly (`stat`, read the JSON/Markdown headers, count expected sections/cards when relevant).
+2. Compare the router final summary against the saved artifacts and machine-readable logs.
+3. If stdout and artifacts disagree, treat the artifacts/logs as the source of truth and report the discrepancy immediately.
+4. If the discrepancy means the user requirement is not satisfied (for example, requested 20 items but artifact contains 33), do not claim success. Either launch a correction pass when permitted or state the exact blocker.
+5. For ingestion workflows, verify the saved ingest JSON fields (`status`, checked/accepted/skipped counts, threshold, document list) and ensure the user-facing Markdown/HTML item set matches the accepted ingested documents.
+
 ## Environment Variables
 
 All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime and injected into every `terminal()` child process. Router.py reads them via `os.environ.get()` with its own defaults for unset variables.
@@ -311,6 +321,8 @@ FLASH finalizer -> (if fails) -> PRO finalizer -> (if fails) -> Deterministic te
 | `scripts/router.py` | Main LangGraph router script |
 | `SKILL.md` | This documentation |
 | `references/long-running-quantitative-tasks.md` | Guidance for heavy Monte Carlo / financial modeling tasks and background execution |
+| `references/background-artifact-launches.md` | Wrapper pattern for background router runs that produce durable artifacts: prompt/context capture, stream logs, verification, and safe handling of blocked launches |
+| `references/source-html-background-wrapper.md` | Concrete pattern for source-tree-to-HTML hierarchy/explainer jobs: source JSON collector, compact router prompt, HTML generator from context+log, background launch, immediate poll, and artifact verification |
 
 ## Troubleshooting
 
