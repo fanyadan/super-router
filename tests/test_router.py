@@ -22,6 +22,7 @@ class RouterHelperTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ,
             {
+                "ROUTER_MODEL": "",
                 "ROUTER_PLANNER_MODEL": "",
                 "ROUTER_JUDGE_MODEL": "",
                 "ROUTER_PRO_MODEL": "",
@@ -42,6 +43,39 @@ class RouterHelperTests(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {"ROUTER_DEBUG": "yes"}, clear=False):
             self.assertTrue(r.router_debug_enabled())
+
+    def test_global_router_model_applies_to_all_roles_unless_overridden(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ROUTER_MODEL": "gpt-5.5",
+                "ROUTER_PLANNER_MODEL": "",
+                "ROUTER_JUDGE_MODEL": "",
+                "ROUTER_PRO_MODEL": "",
+                "ROUTER_FLASH_MODEL": "",
+            },
+            clear=True,
+        ):
+            state = r.create_initial_state("global model check")
+
+        self.assertEqual(state["planner_model"], "gpt-5.5")
+        self.assertEqual(state["judge_model"], "gpt-5.5")
+        self.assertEqual(state["pro_model"], "gpt-5.5")
+        self.assertEqual(state["flash_model"], "gpt-5.5")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ROUTER_MODEL": "gpt-5.5",
+                "ROUTER_FLASH_MODEL": "google-gemini-cli/gemini-3-flash-preview",
+            },
+            clear=True,
+        ):
+            state = r.create_initial_state("role override check")
+
+        self.assertEqual(state["planner_model"], "gpt-5.5")
+        self.assertEqual(state["pro_model"], "gpt-5.5")
+        self.assertEqual(state["flash_model"], "google-gemini-cli/gemini-3-flash-preview")
 
     def test_langsmith_config_metadata_and_tags(self):
         state = r.create_initial_state(
@@ -213,6 +247,30 @@ class RouterHelperTests(unittest.TestCase):
 
         self.assertEqual(captured, [("google-gemini-cli/flash", "prompt", 30, 0.2)])
 
+    def test_generate_text_dispatches_codex_models(self):
+        captured = []
+
+        def fake_codex(model, prompt, *, timeout, num_predict, temperature):
+            captured.append((model, prompt, timeout, num_predict, temperature))
+            return r.build_text_generation_result("ok", {}, "codex", r.normalize_model_name(model))
+
+        with mock.patch.object(r, "codex_generate_with_usage", side_effect=fake_codex):
+            self.assertEqual(
+                r.generate_text("codex/gpt-5.5", "prompt", timeout=30, num_predict=99, temperature=0.2),
+                "ok",
+            )
+
+        self.assertEqual(captured, [("codex/gpt-5.5", "prompt", 30, 99, 0.2)])
+
+    def test_provider_prefixes_take_precedence_over_bare_model_patterns(self):
+        self.assertTrue(r.is_codex_model("gpt-5.5"))
+        self.assertTrue(r.is_codex_model("codex/gpt-5.5"))
+        self.assertFalse(r.is_codex_model("ollama/gpt-5.5"))
+        self.assertFalse(r.is_gemini_model("codex/gemini-3-pro-preview"))
+        self.assertEqual(r.langsmith_provider_name("ollama/gpt-5.5"), "ollama")
+        self.assertEqual(r.model_transport_name("ollama/gpt-5.5"), "ollama_http")
+        self.assertEqual(r.langsmith_provider_name("google-gemini-cli/gpt-5.5"), "google_genai")
+
     def test_invoke_gemini_cli_writes_temperature_settings(self):
         captured = {}
 
@@ -317,6 +375,62 @@ class RouterHelperTests(unittest.TestCase):
                 "candidate_tokens": 3,
             },
         )
+
+    def test_codex_exec_payload_and_output_file(self):
+        captured = {}
+
+        class FakeResult:
+            returncode = 0
+            stdout = "ignored stdout"
+            stderr = ""
+
+        def fake_run(command, *, input, capture_output, text, timeout, env, check):
+            captured["command"] = command
+            captured["input"] = input
+            captured["timeout"] = timeout
+            captured["env_no_color"] = env["NO_COLOR"]
+            output_path = command[command.index("--output-last-message") + 1]
+            with open(output_path, "w", encoding="utf-8") as output_file:
+                output_file.write("codex output")
+            return FakeResult()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ROUTER_CODEX_CWD": "/tmp/codex-work",
+                    "ROUTER_CODEX_SANDBOX": "read-only",
+                },
+                clear=False,
+            ),
+            mock.patch.object(r, "CODEX_CLI_PATH", "/tmp/codex"),
+            mock.patch.object(r.os.path, "exists", return_value=True),
+            mock.patch.object(r.subprocess, "run", side_effect=fake_run),
+        ):
+            result = r.codex_generate_with_usage(
+                "codex/gpt-5.5",
+                "prompt",
+                timeout=11,
+                num_predict=123,
+                temperature=0.1,
+            )
+
+        self.assertEqual(captured["command"][:4], ["/tmp/codex", "exec", "-m", "gpt-5.5"])
+        self.assertIn("--ephemeral", captured["command"])
+        self.assertIn("--skip-git-repo-check", captured["command"])
+        self.assertIn("--output-last-message", captured["command"])
+        self.assertNotIn("--ask-for-approval", captured["command"])
+        self.assertEqual(captured["command"][-1], "-")
+        self.assertEqual(captured["command"][captured["command"].index("--cd") + 1], "/tmp/codex-work")
+        self.assertEqual(captured["command"][captured["command"].index("--sandbox") + 1], "read-only")
+        self.assertEqual(captured["input"], "prompt")
+        self.assertEqual(captured["timeout"], 11)
+        self.assertEqual(captured["env_no_color"], "1")
+        self.assertEqual(result["text"], "codex output")
+        self.assertEqual(result["provider"], "codex")
+        self.assertEqual(result["model_name"], "gpt-5.5")
+        self.assertEqual(result["usage_source"], "unavailable")
+        self.assertEqual(result["usage_metadata"], {})
 
     def test_token_usage_tracking_records_generate_text_calls(self):
         def fake_gemini(model, prompt, *, timeout, temperature):

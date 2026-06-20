@@ -48,7 +48,10 @@ For source hierarchy explainers, pair this with `html-artifact` conventions:
 - an elaborated SVG hierarchy picture;
 - workflow cards for the main execution paths;
 - subsystem guide grouped by source buckets;
-- a Super-Router section that records run dir, context JSON, router log path, and phase/token excerpt.
+- key symbol/function anchors extracted deterministically from the source tree when the source language makes that practical;
+- a Super-Router section that records run dir, context JSON, router log path, router exit code, and phase/token excerpt.
+
+If the router provider partially fails but the wrapper can still generate the artifact from verified local context, the HTML must say that explicitly in the provenance section. Do not claim the failed provider analysis succeeded; make the source inventory plus verification thresholds the source of truth.
 
 ## Minimal verification line
 

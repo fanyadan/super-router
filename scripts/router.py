@@ -35,7 +35,11 @@ except Exception:
     pass
 
 OLLAMA_URL = os.environ.get("ROUTER_OLLAMA_URL", "http://localhost:11434/api/generate")
+ROUTER_MODEL_ENV_VAR = "ROUTER_MODEL"
 ROUTER_TASK_ENV_VAR = "ROUTER_TASK"
+CODEX_CLI_PATH = os.environ.get("ROUTER_CODEX_CLI", shutil.which("codex") or "codex")
+ROUTER_CODEX_CWD_ENV_VAR = "ROUTER_CODEX_CWD"
+ROUTER_CODEX_SANDBOX_ENV_VAR = "ROUTER_CODEX_SANDBOX"
 GEMINI_CLI_PATH = os.environ.get("ROUTER_GEMINI_CLI", shutil.which("gemini") or "/opt/homebrew/bin/gemini")
 GEMINI_SYSTEM_SETTINGS_ENV_VAR = "GEMINI_CLI_SYSTEM_SETTINGS_PATH"
 ROUTER_SKIP_WARMUP = os.environ.get("ROUTER_SKIP_WARMUP", "0").lower() in ("1", "true", "yes")
@@ -557,7 +561,10 @@ def resolve_model(explicit_value: str | None, env_name: str, fallback: str) -> s
     if explicit_value and explicit_value.strip():
         return explicit_value.strip()
     env_value = os.environ.get(env_name, "").strip()
-    return env_value or fallback
+    if env_value:
+        return env_value
+    global_model = os.environ.get(ROUTER_MODEL_ENV_VAR, "").strip()
+    return global_model or fallback
 
 
 def resolve_execution_model(explicit_value: str | None, env_name: str, fallback: str) -> str:
@@ -646,8 +653,10 @@ def compact_text(text: str, limit: int = 160) -> str:
 
 def normalize_model_name(model: str) -> str:
     normalized = model.strip()
-    if normalized.startswith("google-gemini-cli/"):
-        normalized = normalized.split("/", 1)[1]
+    for prefix in ("google-gemini-cli/", "codex/", "ollama/"):
+        if normalized.startswith(prefix):
+            normalized = normalized.split("/", 1)[1]
+            break
     return normalized
 
 
@@ -1178,12 +1187,45 @@ def decide_route(
 
 
 def is_gemini_model(model: str) -> bool:
+    raw = model.strip().lower()
+    if raw.startswith(("codex/", "ollama/")):
+        return False
+    if raw.startswith("google-gemini-cli/"):
+        return True
     normalized = normalize_model_name(model)
     return normalized in {"auto", "pro", "flash", "flash-lite"} or normalized.startswith("gemini-")
 
 
+def is_codex_model(model: str) -> bool:
+    raw = model.strip().lower()
+    if raw.startswith(("google-gemini-cli/", "ollama/")):
+        return False
+    normalized = normalize_model_name(model).lower()
+    if raw.startswith("codex/"):
+        return True
+    if ":" in normalized:
+        return False
+    return (
+        normalized.startswith("gpt-")
+        or normalized.startswith("chatgpt-")
+        or re.match(r"^o\d(?:[-.].*)?$", normalized) is not None
+    )
+
+
+def model_transport_name(model: str) -> str:
+    if is_gemini_model(model):
+        return "gemini_cli"
+    if is_codex_model(model):
+        return "codex_cli"
+    return "ollama_http"
+
+
 def langsmith_provider_name(model: str) -> str:
-    return "google_genai" if is_gemini_model(model) else "ollama"
+    if is_gemini_model(model):
+        return "google_genai"
+    if is_codex_model(model):
+        return "codex"
+    return "ollama"
 
 
 def build_text_generation_result(
@@ -1540,7 +1582,7 @@ def process_langsmith_model_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
     processed: Dict[str, Any] = {
         "model": model,
         "provider": langsmith_provider_name(model),
-        "transport": "gemini_cli" if is_gemini_model(model) else "ollama_http",
+        "transport": model_transport_name(model),
         "timeout": inputs.get("timeout"),
         "num_predict": inputs.get("num_predict"),
         "temperature": inputs.get("temperature"),
@@ -2210,6 +2252,94 @@ def gemini_generate_with_usage(
     return invoke_gemini_cli_with_usage(model, prompt, timeout=timeout, temperature=temperature)
 
 
+def codex_generate_with_usage(
+    model: str,
+    prompt: str,
+    *,
+    timeout: int = 60,
+    num_predict: int = 400,
+    temperature: float = 0.0,
+) -> TextGenerationResult:
+    del num_predict, temperature
+
+    normalized_model = normalize_model_name(model)
+    if os.path.sep in CODEX_CLI_PATH and not os.path.exists(CODEX_CLI_PATH):
+        raise RuntimeError("Codex CLI executable was not found. Set ROUTER_CODEX_CLI or install `codex`.")
+
+    env = dict(os.environ)
+    env["NO_COLOR"] = "1"
+    sandbox = os.environ.get(ROUTER_CODEX_SANDBOX_ENV_VAR, "read-only").strip() or "read-only"
+    command = [
+        CODEX_CLI_PATH,
+        "exec",
+        "-m",
+        normalized_model,
+        "--sandbox",
+        sandbox,
+        "--skip-git-repo-check",
+        "--color",
+        "never",
+        "--ephemeral",
+    ]
+    codex_cwd = os.environ.get(ROUTER_CODEX_CWD_ENV_VAR, "").strip()
+    if codex_cwd:
+        command.extend(["--cd", codex_cwd])
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="router-codex-") as output_dir:
+            output_path = os.path.join(output_dir, "last-message.txt")
+            command.extend(["--output-last-message", output_path, "-"])
+            result = subprocess.run(
+                command,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                check=False,
+            )
+            output_text = ""
+            if os.path.exists(output_path):
+                with open(output_path, "r", encoding="utf-8") as output_file:
+                    output_text = output_file.read().strip()
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Codex CLI timed out after {timeout}s") from exc
+
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if result.returncode != 0:
+        error_text = compact_text(stderr or stdout or f"exit code {result.returncode}", 280)
+        raise RuntimeError(f"Codex CLI failed for model {normalized_model}: {error_text}")
+
+    text = output_text or stdout
+    if not text.strip():
+        raise RuntimeError(f"Codex CLI returned an empty response for model {normalized_model}")
+    return build_text_generation_result(
+        text.strip(),
+        {},
+        "codex",
+        normalized_model,
+        "unavailable",
+    )
+
+
+def codex_generate(
+    model: str,
+    prompt: str,
+    *,
+    timeout: int = 60,
+    num_predict: int = 400,
+    temperature: float = 0.0,
+) -> str:
+    return codex_generate_with_usage(
+        model,
+        prompt,
+        timeout=timeout,
+        num_predict=num_predict,
+        temperature=temperature,
+    )["text"]
+
+
 def _execute_generate_text_with_usage(
     model: str,
     prompt: str,
@@ -2228,6 +2358,14 @@ def _execute_generate_text_with_usage(
     )
     if is_gemini_model(model):
         return gemini_generate_with_usage(model, prompt, timeout=timeout, temperature=temperature)
+    if is_codex_model(model):
+        return codex_generate_with_usage(
+            model,
+            prompt,
+            timeout=timeout,
+            num_predict=num_predict,
+            temperature=temperature,
+        )
     return ollama_generate_with_usage(
         model,
         prompt,

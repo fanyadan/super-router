@@ -60,8 +60,9 @@ final report generation cascade.
 - `langsmith` is optional for telemetry. It is commonly installed with
   LangGraph, but can be installed explicitly with `pip install langsmith`.
 - At least one model provider must be usable:
+  - Codex CLI for `codex/...`, bare `gpt-*`, bare `chatgpt-*`, or bare `o` plus digit model names. Codex must already be installed and logged in.
   - Gemini CLI for `google-gemini-cli/...`, `gemini-*`, `pro`, `flash`, `flash-lite`, or `auto` model names.
-  - Ollama for all other model names.
+  - Ollama for all other model names, or use the `ollama/...` prefix when you want to be explicit.
 - Network access to Google endpoints is required for Gemini CLI unless your
   environment routes through a configured proxy.
 - A running Ollama server is required for Ollama-backed models.
@@ -143,10 +144,16 @@ Hermes automatically loads `~/.hermes/.env` at startup and injects all `ROUTER_*
 
 ```bash
 # ~/.hermes/.env (excerpt)
-ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
-ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
-ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
-ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
+# One model for all router roles. Role-specific variables below override this.
+ROUTER_MODEL=gpt-5.5
+# Equivalent explicit form:
+# ROUTER_MODEL=codex/gpt-5.5
+
+# Optional: override individual router roles.
+# ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
+# ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
+# ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
+# ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
 
 # Optional: enable LangSmith graph/model-call telemetry
 # ROUTER_LANGSMITH_ENABLED=1
@@ -162,13 +169,23 @@ For standalone CLI use, export them in your shell instead:
 
 The router selects the provider from the model name:
 
+- Codex CLI is used when the model name uses the `codex/` prefix, or when a
+  bare model name starts with `gpt-`, `chatgpt-`, or `o` plus a digit, such as
+  `codex/gpt-5.5` or `gpt-5.5`.
+  The router passes `--sandbox` but intentionally does not pass
+  `--ask-for-approval`, because some `codex exec` versions do not support that
+  option.
 - Gemini CLI is used when the model name is one of `auto`, `pro`, `flash`,
   `flash-lite`, starts with `gemini-`, or uses the `google-gemini-cli/` prefix.
-- Ollama is used for all other model names.
+- Ollama is used for all other model names, and `ollama/<model>` is accepted
+  as an explicit Ollama prefix.
 
 Examples:
 
 ```bash
+# One Codex model for planner, judge, PRO, FLASH, metadata extraction, and finalizer.
+export ROUTER_MODEL=gpt-5.5
+
 # Gemini CLI-backed defaults for all router roles.
 export ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
 export ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
@@ -507,12 +524,16 @@ When running standalone, export them in your shell.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ROUTER_TASK` | unset | Task text used when no positional CLI task is provided. |
+| `ROUTER_MODEL` | unset | Global model default for planner, judge, PRO, and FLASH roles. Role-specific `ROUTER_*_MODEL` values override it. |
 | `ROUTER_PLANNER_MODEL` | `google-gemini-cli/gemini-3-pro-preview` | Model used to decompose the original task into subtasks. |
 | `ROUTER_JUDGE_MODEL` | `google-gemini-cli/gemini-3-flash-preview` | Model used for structured complexity scoring. |
 | `ROUTER_PRO_MODEL` | `google-gemini-cli/gemini-3-pro-preview` | Primary heavy reasoning executor and PRO finalizer model. |
 | `ROUTER_FLASH_MODEL` | `google-gemini-cli/gemini-3-flash-preview` | Primary fast executor and FLASH finalizer model. |
 | `ROUTER_PRO_FALLBACK_MODELS` | unset | Comma-separated provider fallback list for PRO. |
 | `ROUTER_FLASH_FALLBACK_MODELS` | unset | Comma-separated provider fallback list for FLASH. |
+| `ROUTER_CODEX_CLI` | first `codex` on `PATH`, else `codex` | Codex CLI executable path for Codex-backed model names. |
+| `ROUTER_CODEX_CWD` | unset | Optional working directory passed to `codex exec --cd`. |
+| `ROUTER_CODEX_SANDBOX` | `read-only` | Sandbox mode passed to `codex exec --sandbox`. |
 | `ROUTER_FLASH_RETRY_BUDGET` | `1` | Number of FLASH retries for transient or unknown failures before recording failure. |
 | `ROUTER_RECURSION_LIMIT` | `128` | LangGraph recursion limit for the main router graph. |
 | `ROUTER_MAX_CONCURRENCY` | `auto` | Max concurrent LangGraph branches for judge and executor fanout. Essential for multi-entity atomic tasks; set to `1` for local 26B+ Judge models or constrained hardware. |

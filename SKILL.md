@@ -70,6 +70,16 @@ All `ROUTER_*` environment variables are set in `~/.hermes/.env`. Hermes Agent l
 
 To see current values: `cat ~/.hermes/.env | grep ROUTER_`
 
+To use one model for every router role, set `ROUTER_MODEL`:
+
+```bash
+ROUTER_MODEL=gpt-5.5
+# Equivalent explicit form:
+# ROUTER_MODEL=codex/gpt-5.5
+```
+
+Role-specific variables such as `ROUTER_PRO_MODEL` and `ROUTER_FLASH_MODEL` override `ROUTER_MODEL` when set.
+
 ### Basic Usage (via exec)
 
 When the user says "走 super-router", "use super-router", or asks for router analysis, invoke router.py directly — the `.env` values are already in the environment:
@@ -136,12 +146,16 @@ All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime 
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
+| `ROUTER_MODEL` | Global model default for planner, judge, PRO, and FLASH roles | None |
 | `ROUTER_PLANNER_MODEL` | Task decomposition model | internal default |
 | `ROUTER_JUDGE_MODEL` | Complexity scoring model | internal default |
 | `ROUTER_PRO_MODEL` | Heavy reasoning executor | internal default |
 | `ROUTER_FLASH_MODEL` | Fast executor | internal default |
 | `ROUTER_PRO_FALLBACK_MODELS` | Comma-separated PRO fallback list | None |
 | `ROUTER_FLASH_FALLBACK_MODELS` | Comma-separated FLASH fallback list | None |
+| `ROUTER_CODEX_CLI` | Codex CLI executable path for Codex-backed model names | first `codex` on `PATH`, else `codex` |
+| `ROUTER_CODEX_CWD` | Optional working directory passed to `codex exec --cd` | None |
+| `ROUTER_CODEX_SANDBOX` | Sandbox mode passed to `codex exec --sandbox` | `read-only` |
 | `ROUTER_FLASH_RETRY_BUDGET` | Max FLASH retries before escalation | 1 |
 | `ROUTER_RECURSION_LIMIT` | Python recursion limit | 128 |
 | `ROUTER_JUDGE_TIMEOUT` | Timeout for Judge node LLM calls (seconds) | 300 |
@@ -160,6 +174,12 @@ All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime 
 | `ROUTER_TOKEN_USAGE_LEDGER` | Optional append-only JSONL path for per-call token usage records | None |
 
 Large local models may require higher timeouts and `ROUTER_MAX_CONCURRENCY=1`.
+
+Provider selection is model-name based:
+- Codex CLI: `codex/...`, bare `gpt-*`, bare `chatgpt-*`, or bare `o` plus digit names such as `codex/gpt-5.5` or `gpt-5.5`.
+  The router passes `--sandbox` but intentionally does not pass `--ask-for-approval`, because some `codex exec` versions do not support that option.
+- Gemini CLI: `google-gemini-cli/...`, `gemini-*`, `pro`, `flash`, `flash-lite`, or `auto`.
+- Ollama: all other model names, or explicit `ollama/...`.
 
 ### LangSmith Telemetry
 
@@ -323,6 +343,8 @@ FLASH finalizer -> (if fails) -> PRO finalizer -> (if fails) -> Deterministic te
 | `references/long-running-quantitative-tasks.md` | Guidance for heavy Monte Carlo / financial modeling tasks and background execution |
 | `references/background-artifact-launches.md` | Wrapper pattern for background router runs that produce durable artifacts: prompt/context capture, stream logs, verification, and safe handling of blocked launches |
 | `references/source-html-background-wrapper.md` | Concrete pattern for source-tree-to-HTML hierarchy/explainer jobs: source JSON collector, compact router prompt, HTML generator from context+log, background launch, immediate poll, and artifact verification |
+| `references/linux-mm-source-html-example.md` | Session-specific exemplar for a large Linux `mm/` source hierarchy HTML guide: bucket taxonomy, artifact sections, and verification thresholds. Use as a model for similarly large kernel/subsystem explainers. |
+| `templates/source-html-background-wrapper.sh` | Copyable shell wrapper template for source-tree-to-HTML background jobs. Use it to avoid retyping the run/status/log/verification scaffold; replace placeholders and tune verification thresholds per artifact. |
 
 ## Troubleshooting
 
