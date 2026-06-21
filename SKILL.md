@@ -156,6 +156,7 @@ All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime 
 | `ROUTER_CODEX_CLI` | Codex CLI executable path for Codex-backed model names | first `codex` on `PATH`, else `codex` |
 | `ROUTER_CODEX_CWD` | Optional working directory passed to `codex exec --cd` | None |
 | `ROUTER_CODEX_SANDBOX` | Sandbox mode passed to `codex exec --sandbox` | `read-only` |
+| `ROUTER_CLAUDE_CLI` | Claude Code CLI executable path for Claude-backed model names | first `claude` on `PATH`, else `claude` |
 | `ROUTER_FLASH_RETRY_BUDGET` | Max FLASH retries before escalation | 1 |
 | `ROUTER_RECURSION_LIMIT` | Python recursion limit | 128 |
 | `ROUTER_JUDGE_TIMEOUT` | Timeout for Judge node LLM calls (seconds) | 300 |
@@ -179,6 +180,7 @@ Provider selection is model-name based:
 - Codex CLI: `codex/...`, bare `gpt-*`, bare `chatgpt-*`, or bare `o` plus digit names such as `codex/gpt-5.5` or `gpt-5.5`.
   The router passes `--sandbox` but intentionally does not pass `--ask-for-approval`, because some `codex exec` versions do not support that option.
 - Gemini CLI: `google-gemini-cli/...`, `gemini-*`, `pro`, `flash`, `flash-lite`, or `auto`.
+- Claude Code CLI: `claude/...` or bare `claude-*` model names.
 - Ollama: all other model names, or explicit `ollama/...`.
 
 ### LangSmith Telemetry
@@ -192,9 +194,10 @@ LANGSMITH_API_KEY=<your-langsmith-key>
 ROUTER_LANGSMITH_PROJECT=super-router
 ```
 
-The router adds graph tags/metadata and traces raw Gemini CLI/Ollama calls as
-child LLM runs. Ollama token usage is captured from `prompt_eval_count` and
-`eval_count`. Gemini CLI token usage is captured from JSON
+The router adds graph tags/metadata and traces raw provider calls as child LLM
+runs. Ollama token usage is captured from `prompt_eval_count` and `eval_count`.
+Claude Code CLI token usage is captured from JSON `total_input_tokens` and
+`total_output_tokens`. Gemini CLI token usage is captured from JSON
 `stats.models.*.tokens` when available, with `usageMetadata`-style fields as a
 fallback. Prompt and output text previews are disabled by default; enable them
 explicitly with `ROUTER_LANGSMITH_TRACE_PROMPTS=1` or

@@ -22,7 +22,7 @@ final report generation cascade.
   risk, and IO heaviness.
 - Routes each subtask to PRO or FLASH based on structured scores, confidence,
   summary detection, and high-risk context rules.
-- Executes subtasks with configurable Gemini CLI or Ollama-backed models.
+- Executes subtasks with configurable Codex CLI, Claude Code CLI, Gemini CLI, or Ollama-backed models.
 - Retries FLASH on transient infrastructure failures.
 - Escalates FLASH work to PRO when the output is empty, low quality, too short,
   or explicitly says the model cannot complete the work.
@@ -61,6 +61,7 @@ final report generation cascade.
   LangGraph, but can be installed explicitly with `pip install langsmith`.
 - At least one model provider must be usable:
   - Codex CLI for `codex/...`, bare `gpt-*`, bare `chatgpt-*`, or bare `o` plus digit model names. Codex must already be installed and logged in.
+  - Claude Code CLI for `claude/...` or bare `claude-*` model names. Claude Code must already be installed and logged in.
   - Gemini CLI for `google-gemini-cli/...`, `gemini-*`, `pro`, `flash`, `flash-lite`, or `auto` model names.
   - Ollama for all other model names, or use the `ollama/...` prefix when you want to be explicit.
 - Network access to Google endpoints is required for Gemini CLI unless your
@@ -109,6 +110,9 @@ ollama pull qwen2.5:7b
 If you plan to use Gemini CLI-backed models, install and authenticate the
 `gemini` executable, or point the router to it with `ROUTER_GEMINI_CLI`.
 
+If you plan to use Claude Code-backed models, install and authenticate the
+`claude` executable, or point the router to it with `ROUTER_CLAUDE_CLI`.
+
 ## Quick Start
 
 Run a task through the router:
@@ -154,6 +158,8 @@ ROUTER_MODEL=gpt-5.5
 # ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
 # ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
 # ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
+# ROUTER_PRO_MODEL=claude/opus
+# ROUTER_FLASH_MODEL=claude/sonnet
 
 # Optional: enable LangSmith graph/model-call telemetry
 # ROUTER_LANGSMITH_ENABLED=1
@@ -177,6 +183,8 @@ The router selects the provider from the model name:
   option.
 - Gemini CLI is used when the model name is one of `auto`, `pro`, `flash`,
   `flash-lite`, starts with `gemini-`, or uses the `google-gemini-cli/` prefix.
+- Claude Code CLI is used when the model name uses the `claude/` prefix or
+  starts with `claude-`.
 - Ollama is used for all other model names, and `ollama/<model>` is accepted
   as an explicit Ollama prefix.
 
@@ -191,6 +199,12 @@ export ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
 export ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
 export ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
 export ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
+
+# Claude Code-backed defaults for all router roles.
+export ROUTER_PLANNER_MODEL=claude/sonnet
+export ROUTER_JUDGE_MODEL=claude/sonnet
+export ROUTER_PRO_MODEL=claude/opus
+export ROUTER_FLASH_MODEL=claude/sonnet
 
 # Ollama-backed planner/judge/executors.
 export ROUTER_PLANNER_MODEL=gemma4:26b
@@ -219,12 +233,14 @@ export ROUTER_LANGSMITH_PROJECT=super-router
 ```
 
 When enabled, the router attaches `super-router`/`langgraph` tags, model
-metadata, retry budget, and task length to the graph run. Raw Gemini CLI and
-Ollama calls are traced as `Super Router Model Call` child runs with prompt and
-output lengths by default. Ollama traces include token usage from
-`prompt_eval_count` and `eval_count`. Gemini CLI traces include token usage from
-JSON output when available, preferring `stats.models.*.tokens` and falling back
-to `usageMetadata`-style fields. To include text previews, opt in with
+metadata, retry budget, and task length to the graph run. Raw provider calls are
+traced as `Super Router Model Call` child runs with prompt and output lengths by
+default. Ollama traces include token usage from
+`prompt_eval_count` and `eval_count`. Claude Code CLI traces include token usage
+from JSON `total_input_tokens` and `total_output_tokens`. Gemini CLI traces
+include token usage from JSON output when available, preferring
+`stats.models.*.tokens` and falling back to `usageMetadata`-style fields. To
+include text previews, opt in with
 `ROUTER_LANGSMITH_TRACE_PROMPTS=1` or `ROUTER_LANGSMITH_TRACE_OUTPUTS=1`.
 
 LangSmith can calculate cost when token usage is present and the provider/model
@@ -243,6 +259,8 @@ provider call is added to an in-process run ledger and printed after the final
 report.
 
 - Ollama usage comes from `prompt_eval_count` and `eval_count`.
+- Claude Code CLI usage comes from JSON `total_input_tokens` and
+  `total_output_tokens`.
 - Gemini CLI usage comes from JSON `stats.models.*.tokens` fields such as
   `prompt`, `candidates`, `thoughts`, `cached`, `tool`, and `total`.
 - If a provider response does not include token data, the call is still recorded
@@ -534,6 +552,7 @@ When running standalone, export them in your shell.
 | `ROUTER_CODEX_CLI` | first `codex` on `PATH`, else `codex` | Codex CLI executable path for Codex-backed model names. |
 | `ROUTER_CODEX_CWD` | unset | Optional working directory passed to `codex exec --cd`. |
 | `ROUTER_CODEX_SANDBOX` | `read-only` | Sandbox mode passed to `codex exec --sandbox`. |
+| `ROUTER_CLAUDE_CLI` | first `claude` on `PATH`, else `claude` | Claude Code CLI executable path for Claude-backed model names. |
 | `ROUTER_FLASH_RETRY_BUDGET` | `1` | Number of FLASH retries for transient or unknown failures before recording failure. |
 | `ROUTER_RECURSION_LIMIT` | `128` | LangGraph recursion limit for the main router graph. |
 | `ROUTER_MAX_CONCURRENCY` | `auto` | Max concurrent LangGraph branches for judge and executor fanout. Essential for multi-entity atomic tasks; set to `1` for local 26B+ Judge models or constrained hardware. |
@@ -703,9 +722,9 @@ Run the tests before and after router changes:
 python -m unittest tests/test_router.py
 ```
 
-The tests use `unittest` and `unittest.mock`; they do not require live Ollama or
-Gemini access. Mock model calls with `mock.patch.object(r, "generate_text", ...)`
-when adding new tests.
+The tests use `unittest` and `unittest.mock`; they do not require live provider
+access. Mock model calls with `mock.patch.object(r, "generate_text", ...)` when
+adding new tests.
 
 Useful focused checks:
 
@@ -761,6 +780,14 @@ Install Gemini CLI or set:
 
 ```bash
 export ROUTER_GEMINI_CLI=/path/to/gemini
+```
+
+### Claude CLI executable was not found
+
+Install Claude Code CLI or set:
+
+```bash
+export ROUTER_CLAUDE_CLI=/path/to/claude
 ```
 
 ### Gemini network preflight failed

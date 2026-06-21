@@ -262,13 +262,33 @@ class RouterHelperTests(unittest.TestCase):
 
         self.assertEqual(captured, [("codex/gpt-5.5", "prompt", 30, 99, 0.2)])
 
+    def test_generate_text_dispatches_claude_models(self):
+        captured = []
+
+        def fake_claude(model, prompt, *, timeout, temperature):
+            captured.append((model, prompt, timeout, temperature))
+            return r.build_text_generation_result("ok", {}, "anthropic", r.normalize_model_name(model))
+
+        with mock.patch.object(r, "claude_generate_with_usage", side_effect=fake_claude):
+            self.assertEqual(
+                r.generate_text("claude/sonnet", "prompt", timeout=30, temperature=0.2),
+                "ok",
+            )
+
+        self.assertEqual(captured, [("claude/sonnet", "prompt", 30, 0.2)])
+
     def test_provider_prefixes_take_precedence_over_bare_model_patterns(self):
         self.assertTrue(r.is_codex_model("gpt-5.5"))
         self.assertTrue(r.is_codex_model("codex/gpt-5.5"))
         self.assertFalse(r.is_codex_model("ollama/gpt-5.5"))
+        self.assertTrue(r.is_claude_model("claude/sonnet"))
+        self.assertTrue(r.is_claude_model("claude-3-5-sonnet-latest"))
+        self.assertFalse(r.is_codex_model("claude/gpt-5.5"))
         self.assertFalse(r.is_gemini_model("codex/gemini-3-pro-preview"))
         self.assertEqual(r.langsmith_provider_name("ollama/gpt-5.5"), "ollama")
         self.assertEqual(r.model_transport_name("ollama/gpt-5.5"), "ollama_http")
+        self.assertEqual(r.langsmith_provider_name("claude/sonnet"), "anthropic")
+        self.assertEqual(r.model_transport_name("claude/sonnet"), "claude_cli")
         self.assertEqual(r.langsmith_provider_name("google-gemini-cli/gpt-5.5"), "google_genai")
 
     def test_invoke_gemini_cli_writes_temperature_settings(self):
@@ -314,6 +334,50 @@ class RouterHelperTests(unittest.TestCase):
         self.assertEqual(captured["stdin"], r.subprocess.DEVNULL)
         self.assertEqual(override["match"], {"model": "gemini-3-pro-preview"})
         self.assertEqual(override["modelConfig"]["generateContentConfig"]["temperature"], 0.0)
+
+    def test_invoke_claude_cli_uses_json_output_and_usage(self):
+        captured = {}
+
+        class FakeResult:
+            returncode = 0
+            stdout = json.dumps(
+                {
+                    "result": "ok",
+                    "total_input_tokens": 5,
+                    "total_output_tokens": 6,
+                }
+            )
+            stderr = ""
+
+        def fake_run(command, *, capture_output, text, timeout, env, check):
+            captured["command"] = command
+            captured["timeout"] = timeout
+            captured["env"] = env
+            return FakeResult()
+
+        with (
+            mock.patch.object(r, "CLAUDE_CLI_PATH", "/tmp/claude"),
+            mock.patch.object(r.os.path, "exists", return_value=True),
+            mock.patch.object(r.subprocess, "run", side_effect=fake_run),
+        ):
+            result = r.claude_generate_with_usage(
+                "claude/sonnet",
+                "prompt",
+                timeout=30,
+                temperature=0.0,
+            )
+
+        self.assertEqual(result["text"], "ok")
+        self.assertEqual(
+            result["usage_metadata"],
+            {"input_tokens": 5, "output_tokens": 6, "total_tokens": 11},
+        )
+        self.assertEqual(
+            captured["command"],
+            ["/tmp/claude", "--model", "sonnet", "--output-format", "json", "-p", "prompt"],
+        )
+        self.assertEqual(captured["timeout"], 30)
+        self.assertEqual(captured["env"]["NO_COLOR"], "1")
 
     def test_provider_usage_metadata_extraction(self):
         class FakeResponse:

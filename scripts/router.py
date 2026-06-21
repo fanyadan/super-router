@@ -41,6 +41,7 @@ CODEX_CLI_PATH = os.environ.get("ROUTER_CODEX_CLI", shutil.which("codex") or "co
 ROUTER_CODEX_CWD_ENV_VAR = "ROUTER_CODEX_CWD"
 ROUTER_CODEX_SANDBOX_ENV_VAR = "ROUTER_CODEX_SANDBOX"
 GEMINI_CLI_PATH = os.environ.get("ROUTER_GEMINI_CLI", shutil.which("gemini") or "/opt/homebrew/bin/gemini")
+CLAUDE_CLI_PATH = os.environ.get("ROUTER_CLAUDE_CLI", shutil.which("claude") or "claude")
 GEMINI_SYSTEM_SETTINGS_ENV_VAR = "GEMINI_CLI_SYSTEM_SETTINGS_PATH"
 ROUTER_SKIP_WARMUP = os.environ.get("ROUTER_SKIP_WARMUP", "0").lower() in ("1", "true", "yes")
 ROUTER_LANGSMITH_ENABLED_ENV_VAR = "ROUTER_LANGSMITH_ENABLED"
@@ -653,7 +654,7 @@ def compact_text(text: str, limit: int = 160) -> str:
 
 def normalize_model_name(model: str) -> str:
     normalized = model.strip()
-    for prefix in ("google-gemini-cli/", "codex/", "ollama/"):
+    for prefix in ("google-gemini-cli/", "codex/", "ollama/", "claude/"):
         if normalized.startswith(prefix):
             normalized = normalized.split("/", 1)[1]
             break
@@ -1188,7 +1189,7 @@ def decide_route(
 
 def is_gemini_model(model: str) -> bool:
     raw = model.strip().lower()
-    if raw.startswith(("codex/", "ollama/")):
+    if raw.startswith(("codex/", "ollama/", "claude/")):
         return False
     if raw.startswith("google-gemini-cli/"):
         return True
@@ -1198,7 +1199,7 @@ def is_gemini_model(model: str) -> bool:
 
 def is_codex_model(model: str) -> bool:
     raw = model.strip().lower()
-    if raw.startswith(("google-gemini-cli/", "ollama/")):
+    if raw.startswith(("google-gemini-cli/", "ollama/", "claude/")):
         return False
     normalized = normalize_model_name(model).lower()
     if raw.startswith("codex/"):
@@ -1212,7 +1213,19 @@ def is_codex_model(model: str) -> bool:
     )
 
 
+def is_claude_model(model: str) -> bool:
+    raw = model.strip().lower()
+    if raw.startswith(("google-gemini-cli/", "codex/", "ollama/")):
+        return False
+    if raw.startswith("claude/"):
+        return True
+    normalized = normalize_model_name(model).lower()
+    return normalized.startswith("claude-")
+
+
 def model_transport_name(model: str) -> str:
+    if is_claude_model(model):
+        return "claude_cli"
     if is_gemini_model(model):
         return "gemini_cli"
     if is_codex_model(model):
@@ -1221,6 +1234,8 @@ def model_transport_name(model: str) -> str:
 
 
 def langsmith_provider_name(model: str) -> str:
+    if is_claude_model(model):
+        return "anthropic"
     if is_gemini_model(model):
         return "google_genai"
     if is_codex_model(model):
@@ -2340,6 +2355,68 @@ def codex_generate(
     )["text"]
 
 
+def claude_generate_with_usage(
+    model: str,
+    prompt: str,
+    *,
+    timeout: int = 120,
+    temperature: float = 0.0,
+) -> TextGenerationResult:
+    del temperature
+
+    normalized_model = normalize_model_name(model)
+    if os.path.sep in CLAUDE_CLI_PATH and not os.path.exists(CLAUDE_CLI_PATH):
+        raise RuntimeError("Claude CLI executable was not found. Set ROUTER_CLAUDE_CLI or install `claude`.")
+
+    env = dict(os.environ)
+    env["NO_COLOR"] = "1"
+    command = [CLAUDE_CLI_PATH, "--model", normalized_model, "--output-format", "json", "-p", prompt]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Claude CLI timed out after {timeout}s") from exc
+
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    if result.returncode != 0:
+        error_text = compact_text(stderr or stdout or f"exit code {result.returncode}", 280)
+        raise RuntimeError(f"Claude CLI failed for model {normalized_model}: {error_text}")
+
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        error_text = compact_text(stderr or stdout or "no output", 280)
+        raise RuntimeError(f"Claude CLI returned non-JSON output for model {normalized_model}: {error_text}") from exc
+
+    if parsed.get("is_error"):
+        error_text = compact_text(parsed.get("result") or stderr or "unknown error", 280)
+        raise RuntimeError(f"Claude CLI reported error for model {normalized_model}: {error_text}")
+
+    text = parsed.get("result", "")
+    if not text.strip():
+        raise RuntimeError(f"Claude CLI returned an empty response for model {normalized_model}")
+
+    usage = normalize_usage_metadata(
+        input_tokens=parsed.get("total_input_tokens"),
+        output_tokens=parsed.get("total_output_tokens"),
+    )
+    return build_text_generation_result(
+        text.strip(),
+        usage or {},
+        "anthropic",
+        normalized_model,
+        "claude_cli_json" if usage else "unavailable",
+    )
+
+
 def _execute_generate_text_with_usage(
     model: str,
     prompt: str,
@@ -2356,6 +2433,8 @@ def _execute_generate_text_with_usage(
         num_predict=num_predict,
         temperature=temperature,
     )
+    if is_claude_model(model):
+        return claude_generate_with_usage(model, prompt, timeout=timeout, temperature=temperature)
     if is_gemini_model(model):
         return gemini_generate_with_usage(model, prompt, timeout=timeout, temperature=temperature)
     if is_codex_model(model):
