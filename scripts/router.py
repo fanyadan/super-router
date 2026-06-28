@@ -371,6 +371,18 @@ DEFAULT_PRO_MODEL = "google-gemini-cli/gemini-3-pro-preview"
 DEFAULT_FLASH_MODEL = "google-gemini-cli/gemini-3-flash-preview"
 DEFAULT_PLANNER_MODEL = DEFAULT_PRO_MODEL
 DEFAULT_JUDGE_MODEL = DEFAULT_FLASH_MODEL
+ROUTER_PLANNER_TASK_CHAR_LIMIT_ENV_VAR = "ROUTER_PLANNER_TASK_CHAR_LIMIT"
+ROUTER_PLANNER_MAX_OUTPUT_TOKENS_ENV_VAR = "ROUTER_PLANNER_MAX_OUTPUT_TOKENS"
+ROUTER_JUDGE_CONTEXT_CHAR_LIMIT_ENV_VAR = "ROUTER_JUDGE_CONTEXT_CHAR_LIMIT"
+ROUTER_EXECUTOR_CONTEXT_CHAR_LIMIT_ENV_VAR = "ROUTER_EXECUTOR_CONTEXT_CHAR_LIMIT"
+ROUTER_METADATA_OUTPUT_CHAR_LIMIT_ENV_VAR = "ROUTER_METADATA_OUTPUT_CHAR_LIMIT"
+ROUTER_FINALIZER_CONTEXT_CHAR_LIMIT_ENV_VAR = "ROUTER_FINALIZER_CONTEXT_CHAR_LIMIT"
+DEFAULT_PLANNER_TASK_CHAR_LIMIT = 6000
+DEFAULT_PLANNER_MAX_OUTPUT_TOKENS = 4096
+DEFAULT_JUDGE_CONTEXT_CHAR_LIMIT = 3000
+DEFAULT_EXECUTOR_CONTEXT_CHAR_LIMIT = 8000
+DEFAULT_METADATA_OUTPUT_CHAR_LIMIT = 6000
+DEFAULT_FINALIZER_CONTEXT_CHAR_LIMIT = 12000
 GEMINI_PREFLIGHT_RESULTS: Dict[str, str] = {}
 GEMINI_NETWORK_PREFLIGHT_RESULT: str | None = None
 TOKEN_USAGE_RUN_ID: contextvars.ContextVar[str] = contextvars.ContextVar("TOKEN_USAGE_RUN_ID", default="")
@@ -650,6 +662,836 @@ def compact_text(text: str, limit: int = 160) -> str:
     if len(one_line) <= limit:
         return one_line
     return one_line[: limit - 3] + "..."
+
+
+def compact_text_middle(text: str, limit: int) -> str:
+    one_line = " ".join(text.strip().split())
+    if len(one_line) <= limit:
+        return one_line
+    if limit <= 3:
+        return one_line[:limit]
+    marker = " ... "
+    available = limit - len(marker)
+    if available <= 0:
+        return one_line[:limit]
+    head_size = max(1, available // 2)
+    tail_size = max(1, available - head_size)
+    return f"{one_line[:head_size].rstrip()}{marker}{one_line[-tail_size:].lstrip()}"
+
+
+PLANNER_RELEVANT_TASK_KEYWORDS = (
+    "must",
+    "should",
+    "need",
+    "needs",
+    "required",
+    "requirement",
+    "constraint",
+    "deliverable",
+    "output",
+    "format",
+    "table",
+    "summary",
+    "report",
+    "brief",
+    "compare",
+    "analy",
+    "debug",
+    "diagnos",
+    "fix",
+    "implement",
+    "investig",
+    "trace",
+    "optimiz",
+    "refactor",
+    "rewrite",
+    "migrate",
+    "design",
+    "component",
+    "provider",
+    "model",
+    "file",
+    "service",
+    "region",
+    "backend",
+    "risk",
+    "incident",
+    "rollback",
+    "validation",
+    "test",
+    "evidence",
+    "citation",
+    "version",
+    "metric",
+    "limit",
+    "budget",
+)
+PLANNER_CONSTRAINT_KEYWORDS = (
+    "must",
+    "should",
+    "required",
+    "requirement",
+    "constraint",
+    "preserve",
+    "do not",
+    "avoid",
+    "without",
+    "risk",
+    "rollback",
+    "security",
+    "pci",
+    "budget",
+    "deadline",
+    "slo",
+    "sla",
+    "必须",
+    "需要",
+    "要求",
+    "约束",
+    "保留",
+    "不要",
+    "避免",
+    "风险",
+    "回滚",
+    "安全",
+    "预算",
+)
+PLANNER_DELIVERABLE_KEYWORDS = (
+    "deliverable",
+    "output",
+    "return",
+    "write",
+    "summary",
+    "report",
+    "brief",
+    "table",
+    "format",
+    "final",
+    "include",
+    "artifact",
+    "产出",
+    "输出",
+    "返回",
+    "总结",
+    "报告",
+    "简报",
+    "表格",
+    "格式",
+    "最终",
+    "包含",
+)
+PLANNER_EVIDENCE_KEYWORDS = (
+    "evidence",
+    "metric",
+    "metrics",
+    "version",
+    "versions",
+    "hard limit",
+    "limit",
+    "citation",
+    "citations",
+    "file",
+    "files",
+    "command",
+    "commands",
+    "test",
+    "tests",
+    "validation",
+    "verify",
+    "logs",
+    "traces",
+    "数据",
+    "证据",
+    "指标",
+    "版本",
+    "限制",
+    "引用",
+    "文件",
+    "命令",
+    "测试",
+    "验证",
+    "日志",
+)
+PLANNER_DECOMPOSITION_HINT_KEYWORDS = (
+    "each",
+    "per",
+    "independent",
+    "component",
+    "components",
+    "provider",
+    "providers",
+    "model",
+    "models",
+    "region",
+    "regions",
+    "backend",
+    "backends",
+    "service",
+    "services",
+    "technical area",
+    "technical areas",
+    "entity",
+    "entities",
+    "每个",
+    "分别",
+    "独立",
+    "组件",
+    "提供商",
+    "模型",
+    "区域",
+    "后端",
+    "服务",
+    "技术领域",
+)
+PLANNER_ENTITY_LIST_PATTERNS = (
+    r"\b(?:across|between|among|covering|including)\s+([^.;\n]+)",
+    r"\b(?:components?|services?|providers?|models?|regions?|backends?|technical areas?|entities)\s*[:=]\s*([^.;\n]+)",
+    r"\bone\s+per\s+([^.;\n]+)",
+)
+PLANNER_ENTITY_STOPWORDS = {
+    "a",
+    "an",
+    "analyze",
+    "and",
+    "avoid",
+    "brief",
+    "do",
+    "each",
+    "final",
+    "goal",
+    "if",
+    "include",
+    "including",
+    "investigate",
+    "must",
+    "one",
+    "output",
+    "preserve",
+    "required",
+    "return",
+    "role",
+    "rules",
+    "should",
+    "summary",
+    "task",
+    "technical",
+    "the",
+    "this",
+    "with",
+}
+
+
+def split_planner_task_segments(task: str) -> List[str]:
+    segments: List[str] = []
+    for line in task.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = re.split(r"(?<=[.!?])\s+", stripped)
+        for part in parts:
+            normalized = " ".join(part.strip().split())
+            if normalized:
+                segments.append(normalized)
+    return segments
+
+
+def is_planner_relevant_task_segment(segment: str) -> bool:
+    stripped = segment.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if contains_any(lowered, PLANNER_RELEVANT_TASK_KEYWORDS):
+        return True
+    if re.search(r"^([-*+]|\d+[.)]|[A-Za-z][.)])\s+", stripped):
+        return True
+    if "`" in stripped:
+        return True
+    return bool(re.search(r"\b[A-Z][A-Za-z0-9_.:/-]{2,}\b", stripped))
+
+
+def compact_planner_relevant_segment(segment: str, limit: int) -> str:
+    return compact_text_middle(segment, limit)
+
+
+def compact_planner_task(task: str, limit: int) -> str:
+    one_line = " ".join(task.strip().split())
+    if len(one_line) <= limit:
+        return one_line
+    if limit < 240:
+        return compact_text_middle(one_line, limit)
+
+    marker = f"[planner input compacted from {len(one_line)} chars]"
+    remaining = limit - len(marker) - 2
+    if remaining < 160:
+        return compact_text_middle(one_line, limit)
+
+    head_budget = min(max(240, remaining // 4), remaining // 2)
+    tail_budget = min(max(200, remaining // 5), remaining - head_budget)
+    head = one_line[:head_budget].rstrip()
+    tail = one_line[-tail_budget:].lstrip()
+    middle_budget = remaining - len(head) - len(tail)
+
+    selected: List[str] = []
+    used = 0
+    if middle_budget > 80:
+        for segment in split_planner_task_segments(task):
+            if not is_planner_relevant_task_segment(segment):
+                continue
+            if segment in head or segment in tail:
+                continue
+            spacing = 1 if selected else 0
+            available = middle_budget - used - spacing
+            if available < 60:
+                break
+            compacted_segment = compact_planner_relevant_segment(segment, min(220, available))
+            selected.append(compacted_segment)
+            used += len(compacted_segment) + spacing
+
+    middle = " ".join(selected)
+    compacted = " ".join(part for part in (head, marker, middle, tail) if part)
+    if len(compacted) <= limit:
+        return compacted
+    return compact_text_middle(compacted, limit)
+
+
+def append_unique_planner_item(items: List[str], value: str, max_items: int, item_limit: int) -> None:
+    normalized = " ".join(value.strip().strip("`'\"-:;,.()[]{}").split())
+    if not normalized:
+        return
+    if len(normalized) < 2 or normalized.isdigit():
+        return
+    if normalized.lower() in PLANNER_ENTITY_STOPWORDS:
+        return
+    compacted = compact_text_middle(normalized, item_limit)
+    existing = {item.lower() for item in items}
+    if compacted.lower() in existing:
+        return
+    items.append(compacted)
+    if len(items) > max_items:
+        del items[max_items:]
+
+
+def split_planner_entity_list(text: str) -> List[str]:
+    normalized = re.sub(r"\b(?:and|or)\b", ",", text, flags=re.IGNORECASE)
+    normalized = normalized.replace("/", ",")
+    entities: List[str] = []
+    for raw_part in re.split(r"[,;|]", normalized):
+        part = " ".join(raw_part.strip().strip("`'\"-:;,.()[]{}").split())
+        part = re.sub(r"^(?:the|a|an)\s+", "", part, flags=re.IGNORECASE)
+        if not part:
+            continue
+        if len(part.split()) > 6:
+            continue
+        entities.append(part)
+    return entities
+
+
+def extract_planner_entities(segments: List[str], max_items: int = 24) -> List[str]:
+    entities: List[str] = []
+    for segment in segments:
+        for pattern in PLANNER_ENTITY_LIST_PATTERNS:
+            for match in re.finditer(pattern, segment, flags=re.IGNORECASE):
+                for entity in split_planner_entity_list(match.group(1)):
+                    append_unique_planner_item(entities, entity, max_items, 80)
+
+        for code_match in re.finditer(r"`([^`]{2,120})`", segment):
+            append_unique_planner_item(entities, code_match.group(1), max_items, 80)
+
+        for path_match in re.finditer(
+            r"\b(?:[\w.-]+/)+[\w./-]+|\b[\w.-]+\.(?:py|js|ts|tsx|json|ya?ml|md|sql|go|rs|java|sh|tf)\b",
+            segment,
+        ):
+            append_unique_planner_item(entities, path_match.group(0), max_items, 80)
+
+        for token_match in re.finditer(r"\b[A-Z][A-Za-z0-9]*(?:[-_./:][A-Za-z0-9]+)*\b|\b[a-z]+(?:-[a-z0-9]+)+\b", segment):
+            append_unique_planner_item(entities, token_match.group(0), max_items, 80)
+
+        if len(entities) >= max_items:
+            break
+    return entities
+
+
+def collect_planner_segments(
+    segments: List[str],
+    keywords: tuple[str, ...],
+    *,
+    max_items: int,
+    item_limit: int = 180,
+) -> List[str]:
+    collected: List[str] = []
+    for segment in segments:
+        lowered = segment.lower()
+        if contains_any(lowered, keywords):
+            append_unique_planner_item(collected, segment, max_items, item_limit)
+        if len(collected) >= max_items:
+            break
+    return collected
+
+
+def serialize_planner_manifest(manifest: Dict[str, Any]) -> str:
+    return json.dumps(manifest, ensure_ascii=False, indent=2)
+
+
+def build_planner_manifest_payload(
+    task: str,
+    source_brief_budget: int,
+    *,
+    max_entities: int = 24,
+    max_constraints: int = 10,
+    max_deliverables: int = 8,
+    max_evidence: int = 8,
+    max_decomposition_hints: int = 8,
+) -> Dict[str, Any]:
+    one_line = " ".join(task.strip().split())
+    segments = split_planner_task_segments(task)
+    objective = segments[0] if segments else one_line
+    return {
+        "original_chars": len(one_line),
+        "objective": compact_text_middle(objective, 420),
+        "entities": extract_planner_entities(segments, max_items=max_entities),
+        "constraints": collect_planner_segments(
+            segments,
+            PLANNER_CONSTRAINT_KEYWORDS,
+            max_items=max_constraints,
+        ),
+        "deliverables": collect_planner_segments(
+            segments,
+            PLANNER_DELIVERABLE_KEYWORDS,
+            max_items=max_deliverables,
+        ),
+        "evidence_requirements": collect_planner_segments(
+            segments,
+            PLANNER_EVIDENCE_KEYWORDS,
+            max_items=max_evidence,
+        ),
+        "decomposition_hints": collect_planner_segments(
+            segments,
+            PLANNER_DECOMPOSITION_HINT_KEYWORDS,
+            max_items=max_decomposition_hints,
+        ),
+        "source_brief": compact_planner_task(task, source_brief_budget),
+    }
+
+
+def build_planner_context_manifest(task: str, limit: int) -> str:
+    one_line = " ".join(task.strip().split())
+    effective_limit = max(240, limit)
+    source_brief_budget = max(80, min(2000, effective_limit // 3))
+    manifest = build_planner_manifest_payload(task, source_brief_budget)
+    serialized = serialize_planner_manifest(manifest)
+    if len(serialized) <= effective_limit:
+        return serialized
+
+    for item_count in (8, 4, 2, 1, 0):
+        source_budget = max(40, min(source_brief_budget, effective_limit // 5))
+        manifest = build_planner_manifest_payload(
+            task,
+            source_budget,
+            max_entities=max(4, item_count * 2),
+            max_constraints=item_count,
+            max_deliverables=item_count,
+            max_evidence=item_count,
+            max_decomposition_hints=item_count,
+        )
+        serialized = serialize_planner_manifest(manifest)
+        if len(serialized) <= effective_limit:
+            return serialized
+
+    minimal_manifest = {
+        "original_chars": len(one_line),
+        "objective": compact_text_middle(one_line, max(40, effective_limit // 4)),
+        "entities": [],
+        "constraints": [],
+        "deliverables": [],
+        "evidence_requirements": [],
+        "decomposition_hints": [],
+        "source_brief": compact_text_middle(one_line, max(40, effective_limit // 4)),
+    }
+    serialized = serialize_planner_manifest(minimal_manifest)
+    if len(serialized) <= effective_limit:
+        return serialized
+    return json.dumps(
+        {"source_brief": compact_text_middle(one_line, max(1, effective_limit - 24))},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def resolve_context_char_limit(env_name: str, fallback: int, task: str = "", subtask_desc: str = "") -> int:
+    if os.environ.get(env_name, "").strip():
+        return resolve_positive_int(None, env_name, fallback)
+    if task and is_high_risk_context(task, subtask_desc):
+        return fallback * 2
+    return fallback
+
+
+def tokenize_context_text(text: str) -> set[str]:
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{2,}", text)
+    }
+
+
+def prioritize_items_for_context(items: List[str], text: str, max_items: int) -> List[str]:
+    if max_items <= 0:
+        return []
+    text_lower = text.lower()
+    text_tokens = tokenize_context_text(text)
+    relevant: List[str] = []
+    remainder: List[str] = []
+    for item in items:
+        item_lower = item.lower()
+        item_tokens = tokenize_context_text(item)
+        if item_lower in text_lower or (item_tokens and item_tokens & text_tokens):
+            relevant.append(item)
+        else:
+            remainder.append(item)
+    return (relevant + remainder)[:max_items]
+
+
+def matched_context_keywords(text: str, keywords: tuple[str, ...], max_items: int = 12) -> List[str]:
+    lowered = text.lower()
+    matched: List[str] = []
+    for keyword in keywords:
+        if keyword in lowered and keyword not in matched:
+            matched.append(keyword)
+        if len(matched) >= max_items:
+            break
+    return matched
+
+
+def serialize_context_payload(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def build_task_context_payload(
+    task: str,
+    subtask_desc: str = "",
+    *,
+    source_brief_budget: int,
+    max_entities: int = 24,
+    max_constraints: int = 10,
+    max_deliverables: int = 8,
+    max_evidence: int = 8,
+    max_decomposition_hints: int = 8,
+) -> Dict[str, Any]:
+    manifest = build_planner_manifest_payload(
+        task,
+        source_brief_budget,
+        max_entities=max(max_entities, 24),
+        max_constraints=max_constraints,
+        max_deliverables=max_deliverables,
+        max_evidence=max_evidence,
+        max_decomposition_hints=max_decomposition_hints,
+    )
+    context_text = f"{task}\n{subtask_desc}"
+    payload: Dict[str, Any] = {
+        "original_chars": manifest["original_chars"],
+        "objective": manifest["objective"],
+    }
+    if subtask_desc:
+        payload["subtask"] = compact_text_middle(subtask_desc, 420)
+    payload.update(
+        {
+            "entities": prioritize_items_for_context(
+                manifest["entities"],
+                subtask_desc or task,
+                max_entities,
+            ),
+            "constraints": manifest["constraints"][:max_constraints],
+            "deliverables": manifest["deliverables"][:max_deliverables],
+            "evidence_requirements": manifest["evidence_requirements"][:max_evidence],
+            "decomposition_hints": manifest["decomposition_hints"][:max_decomposition_hints],
+            "risk_context": {
+                "high_risk": is_high_risk_context(task, subtask_desc),
+                "matched_keywords": matched_context_keywords(context_text, HIGH_RISK_CONTEXT_KEYWORDS),
+            },
+            "source_brief": manifest["source_brief"],
+        }
+    )
+    return payload
+
+
+def build_task_context_pack_json(task: str, subtask_desc: str, limit: int) -> str:
+    effective_limit = max(240, limit)
+    source_brief_budget = max(80, min(2000, effective_limit // 3))
+    for item_count in (12, 8, 4, 2, 1):
+        payload = build_task_context_payload(
+            task,
+            subtask_desc,
+            source_brief_budget=source_brief_budget,
+            max_entities=max(4, item_count * 2),
+            max_constraints=item_count,
+            max_deliverables=item_count,
+            max_evidence=item_count,
+            max_decomposition_hints=item_count,
+        )
+        serialized = serialize_context_payload(payload)
+        if len(serialized) <= effective_limit:
+            return serialized
+        source_brief_budget = max(40, source_brief_budget // 2)
+    return serialize_context_payload(
+        build_task_context_payload(
+            task,
+            subtask_desc,
+            source_brief_budget=max(40, effective_limit // 8),
+            max_entities=2,
+            max_constraints=1,
+            max_deliverables=1,
+            max_evidence=1,
+            max_decomposition_hints=1,
+        )
+    )
+
+
+def build_judge_context_pack_json(task: str, subtask_desc: str) -> str:
+    limit = resolve_context_char_limit(
+        ROUTER_JUDGE_CONTEXT_CHAR_LIMIT_ENV_VAR,
+        DEFAULT_JUDGE_CONTEXT_CHAR_LIMIT,
+        task,
+        subtask_desc,
+    )
+    return build_task_context_pack_json(task, subtask_desc, limit)
+
+
+def compact_step_result_for_context(result: StepResult, output_limit: int) -> Dict[str, Any]:
+    return {
+        "step": result["step"],
+        "planned_route": result["planned_route"],
+        "actual_route": result["route"],
+        "model_name": result["model_name"],
+        "status": result["status"],
+        "desc": compact_text_middle(result["desc"], 220),
+        "output_excerpt": compact_text_middle(result["output"], output_limit) if output_limit > 0 else "",
+        "attempt_count": result["attempt_count"],
+        "retry_count": result["retry_count"],
+        "escalated_from_flash": result["escalated_from_flash"],
+        "used_provider_fallback": result["used_provider_fallback"],
+    }
+
+
+def build_executor_context_payload(
+    state: RouterState,
+    route: Literal["PRO", "FLASH"],
+    *,
+    source_brief_budget: int,
+    prior_output_limit: int,
+    max_prior_results: int,
+    item_count: int,
+) -> Dict[str, Any]:
+    subtask_desc = str(state["active_subtask"].get("desc", "N/A"))
+    assessment = state["active_subtask"].get("assessment") or {}
+    prior_results = state["results"][-max_prior_results:] if max_prior_results > 0 else []
+    payload: Dict[str, Any] = {
+        "task_context": build_task_context_payload(
+            state["task"],
+            subtask_desc,
+            source_brief_budget=source_brief_budget,
+            max_entities=max(4, item_count * 2),
+            max_constraints=item_count,
+            max_deliverables=item_count,
+            max_evidence=item_count,
+            max_decomposition_hints=item_count,
+        ),
+        "routing": {
+            "route": route,
+            "score": assessment.get("complexity_score", "N/A"),
+            "confidence": assessment.get("confidence", "N/A"),
+            "reason": str(assessment.get("reason", "N/A")),
+        },
+        "prior_results": [
+            compact_step_result_for_context(result, prior_output_limit)
+            for result in prior_results
+        ],
+        "response_contract": "Return only the result for the current subtask. No markdown fences.",
+    }
+    if route == PRO and state["active_escalated_from_flash"]:
+        flash_review = state["active_flash_review"]
+        payload["escalation"] = {
+            "from": FLASH,
+            "to": PRO,
+            "failure_type": flash_review["failure_type"],
+            "retries": state["active_retry_count"],
+            "reason": flash_review["reason"],
+        }
+    return payload
+
+
+def build_executor_context_pack_json(state: RouterState, route: Literal["PRO", "FLASH"]) -> str:
+    subtask_desc = str(state["active_subtask"].get("desc", ""))
+    limit = resolve_context_char_limit(
+        ROUTER_EXECUTOR_CONTEXT_CHAR_LIMIT_ENV_VAR,
+        DEFAULT_EXECUTOR_CONTEXT_CHAR_LIMIT,
+        state["task"],
+        subtask_desc,
+    )
+    effective_limit = max(480, limit)
+    source_brief_budget = max(120, min(3000, effective_limit // 3))
+    max_prior = len(state["results"])
+    for item_count, prior_limit, prior_count in (
+        (12, 320, max_prior),
+        (8, 220, min(max_prior, 8)),
+        (4, 140, min(max_prior, 4)),
+        (2, 80, min(max_prior, 2)),
+        (1, 0, 0),
+    ):
+        payload = build_executor_context_payload(
+            state,
+            route,
+            source_brief_budget=source_brief_budget,
+            prior_output_limit=prior_limit,
+            max_prior_results=prior_count,
+            item_count=item_count,
+        )
+        serialized = serialize_context_payload(payload)
+        if len(serialized) <= effective_limit:
+            return serialized
+        source_brief_budget = max(60, source_brief_budget // 2)
+    return serialize_context_payload(
+        build_executor_context_payload(
+            state,
+            route,
+            source_brief_budget=60,
+            prior_output_limit=0,
+            max_prior_results=0,
+            item_count=1,
+        )
+    )
+
+
+def build_metadata_context_pack_json(state: RouterState, result: StepResult, output: str) -> str:
+    limit = resolve_context_char_limit(
+        ROUTER_METADATA_OUTPUT_CHAR_LIMIT_ENV_VAR,
+        DEFAULT_METADATA_OUTPUT_CHAR_LIMIT,
+        state["task"],
+        result["desc"],
+    )
+    effective_limit = max(480, limit)
+    output_budget = max(120, min(effective_limit // 2, DEFAULT_METADATA_OUTPUT_CHAR_LIMIT))
+    for item_count in (8, 4, 2, 1):
+        payload = {
+            "task_context": build_task_context_payload(
+                state["task"],
+                result["desc"],
+                source_brief_budget=max(80, effective_limit // 5),
+                max_entities=max(4, item_count * 2),
+                max_constraints=item_count,
+                max_deliverables=item_count,
+                max_evidence=item_count,
+                max_decomposition_hints=item_count,
+            ),
+            "result": compact_step_result_for_context(result, 0),
+            "output_excerpt": compact_text_middle(output, output_budget),
+            "extraction_schema": [
+                "architectural_decisions",
+                "library_or_tool_choices",
+                "critical_logic_or_algorithm_details",
+                "tradeoffs",
+                "verified_results",
+            ],
+        }
+        serialized = serialize_context_payload(payload)
+        if len(serialized) <= effective_limit:
+            return serialized
+        output_budget = max(80, output_budget // 2)
+    return serialize_context_payload(
+        {
+            "task_context": build_task_context_payload(
+                state["task"],
+                result["desc"],
+                source_brief_budget=40,
+                max_entities=4,
+                max_constraints=1,
+                max_deliverables=1,
+                max_evidence=1,
+                max_decomposition_hints=1,
+            ),
+            "result": compact_step_result_for_context(result, 0),
+            "output_excerpt": compact_text_middle(output, max(80, effective_limit // 4)),
+        }
+    )
+
+
+def build_finalizer_context_payload(
+    state: RouterState,
+    route: Literal["PRO", "FLASH"],
+    *,
+    source_brief_budget: int,
+    result_output_limit: int,
+    max_results: int,
+    metadata_limit: int,
+    item_count: int,
+) -> Dict[str, Any]:
+    metadata_blocks = [line for line in state["history"] if "TECHNICAL METADATA STEP" in line]
+    results = state["results"][-max_results:] if max_results > 0 else []
+    return {
+        "task_context": build_task_context_payload(
+            state["task"],
+            "",
+            source_brief_budget=source_brief_budget,
+            max_entities=max(4, item_count * 2),
+            max_constraints=item_count,
+            max_deliverables=item_count,
+            max_evidence=item_count,
+            max_decomposition_hints=item_count,
+        ),
+        "models": {
+            "planner": state["planner_model"],
+            "judge": state["judge_model"],
+            "finalizer_route": route,
+        },
+        "technical_metadata": [
+            compact_text_middle(block, metadata_limit) for block in metadata_blocks
+        ] or ["No technical metadata extracted."],
+        "execution_results": [
+            compact_step_result_for_context(result, result_output_limit)
+            for result in results
+        ],
+        "required_sections": ["Routing Summary", "Step Outcomes", "Next Action"],
+    }
+
+
+def build_finalizer_context_pack_json(state: RouterState, route: Literal["PRO", "FLASH"]) -> str:
+    limit = resolve_context_char_limit(
+        ROUTER_FINALIZER_CONTEXT_CHAR_LIMIT_ENV_VAR,
+        DEFAULT_FINALIZER_CONTEXT_CHAR_LIMIT,
+        state["task"],
+        "",
+    )
+    effective_limit = max(800, limit)
+    max_results = len(state["results"])
+    source_brief_budget = max(160, min(3000, effective_limit // 4))
+    for item_count, result_limit, result_count, metadata_limit in (
+        (12, 360, max_results, 900),
+        (8, 240, min(max_results, 12), 600),
+        (4, 160, min(max_results, 8), 420),
+        (2, 80, min(max_results, 4), 240),
+        (1, 0, min(max_results, 2), 160),
+    ):
+        payload = build_finalizer_context_payload(
+            state,
+            route,
+            source_brief_budget=source_brief_budget,
+            result_output_limit=result_limit,
+            max_results=result_count,
+            metadata_limit=metadata_limit,
+            item_count=item_count,
+        )
+        serialized = serialize_context_payload(payload)
+        if len(serialized) <= effective_limit:
+            return serialized
+        source_brief_budget = max(80, source_brief_budget // 2)
+    return serialize_context_payload(
+        build_finalizer_context_payload(
+            state,
+            route,
+            source_brief_budget=80,
+            result_output_limit=0,
+            max_results=min(max_results, 1),
+            metadata_limit=120,
+            item_count=1,
+        )
+    )
 
 
 def normalize_model_name(model: str) -> str:
@@ -2609,30 +3451,44 @@ def build_fallback_subtasks(task: str) -> List[PlannedSubtask]:
 
 
 def build_planner_prompt(task: str) -> str:
+    task_limit = resolve_positive_int(
+        None,
+        ROUTER_PLANNER_TASK_CHAR_LIMIT_ENV_VAR,
+        DEFAULT_PLANNER_TASK_CHAR_LIMIT,
+    )
+    planner_context = build_planner_context_manifest(task, task_limit)
+    original_chars = len(" ".join(task.strip().split()))
+    compaction_note = ""
+    if len(planner_context) < original_chars:
+        compaction_note = (
+            f"Planner context manifest compacted from {original_chars} to {len(planner_context)} chars. "
+            "Plan from the manifest JSON's objective, entities, constraints, deliverables, evidence requirements, "
+            "and decomposition hints; do not copy omitted context into every subtask.\n"
+        )
     return (
-        "Role: Expert Technical Architect and Task Decomposer.\\n"
-        f"Task: {task}\\n"
-        "Instruction: Break the task into atomic, actionable, and outcome-oriented subtasks. Each subtask must be a discrete unit of work.\\n"
-        "CRITICAL FOR PARALLELISM: If the task involves multiple entities, technologies, or components (e.g., 3 different model families, 5 providers, 10 files), you MUST create a separate subtask for EACH individual entity. Do not group them into a single 'Research' or 'Analysis' phase. One entity = One subtask.\\n"
-        "TECHNICAL GOLD REQUIREMENT: For each research or analysis subtask, explicitly aim to identify quantitative metrics, specific version numbers, architectural constants, and hard limits. This 'Technical Gold' is required for the final synthesis.\\n"
-        "Structure: When a task mixes investigation and reporting, keep the reporting/update step separate from the investigation step.\\n"
-        "Artifacts: If the task asks for a summary, update, impact note, or table, you MUST emit that as its own final subtask.\\n"
-        "Do not assign model labels, complexity labels, or scores.\\n"
-        "Output rules: Return a raw JSON array only. Each item must be an object with key 'desc'.\\n"
-        "Example 1 (Parallel): Research the KV cache of Llama-3 and Mistral-v0.3.\\n"
-        "Example 1 Output: [{\"desc\":\"Analyze Llama-3 KV cache implementation and bandwidth metrics\"},{\"desc\":\"Analyze Mistral-v0.3 KV cache implementation and bandwidth metrics\"},{\"desc\":\"Synthesize a technical comparison table of KV cache metrics\"}]\\n"
-        "Example 2: Debug an API failure and send a la-concise team update.\\n"
-        "Example 2 Output: [{\"desc\":\"Inspect the failing API path and isolate the root cause\"},{\"desc\":\"Prepare a concise team status update with the findings\"}]\\n"
+        "Role: Task decomposition planner.\n"
+        "Goal: produce the execution plan only; do not solve the task.\n"
+        f"{compaction_note}"
+        "Planner context manifest JSON:\n"
+        f"{planner_context}\n"
+        "Rules:\n"
+        "- Split by independent entity, component, file, provider, region, backend, or technical area.\n"
+        "- Keep investigation, implementation, validation, and reporting/update work as separate subtasks when mixed.\n"
+        "- For research or analysis, ask for metrics, versions, hard limits, citations, files, or commands when relevant.\n"
+        "- Preserve required deliverables and constraints.\n"
+        "- Do not assign model labels, complexity labels, or scores.\n"
+        "Return raw JSON only: [{\"desc\":\"atomic actionable subtask\"}]\n"
         "JSON Output:"
     )
 
 
 def build_judge_prompt(task: str, subtask_desc: str) -> str:
+    context_pack = build_judge_context_pack_json(task, subtask_desc)
     return (
         "Role: Complexity judge for model routing.\n"
-        f"Original task: {task}\n"
+        f"Task context JSON:\n{context_pack}\n"
         f"Subtask: {subtask_desc}\n"
-        "Judge the subtask itself, but use the original task to understand domain risk. Only avoid inheriting the overall-task complexity when the subtask is purely a summary, report, or status update.\n"
+        "Judge the subtask itself, but use the task context JSON to understand domain risk. Only avoid inheriting the overall-task complexity when the subtask is purely a summary, report, or status update.\n"
         "Score the subtask with these ranges:\n"
         "- reasoning_depth: 0-3 (0 = lookup/formatting only, 1 = straightforward transformation, 2 = debugging or multi-step reasoning, 3 = architecture or open-ended investigation)\n"
         "- code_change_scope: 0-3 (0 = no code changes, 1 = small local edit, 2 = non-trivial or multi-file change, 3 = broad refactor/migration)\n"
@@ -3050,11 +3906,16 @@ def route_after_planner_warmup(state: RouterState) -> str:
 def planner_invoke_node(state: RouterState) -> Dict[str, Any]:
     print("\n[Node: Planner Invoke] 🧠 调用规划模型拆解任务...")
     try:
+        planner_output_tokens = resolve_positive_int(
+            None,
+            ROUTER_PLANNER_MAX_OUTPUT_TOKENS_ENV_VAR,
+            DEFAULT_PLANNER_MAX_OUTPUT_TOKENS,
+        )
         raw_text = generate_text(
             state["planner_model"],
             build_planner_prompt(state["task"]),
             timeout=300,  # 5 minutes for large models like gemma4:26b
-            num_predict=409600,  # Increased for full JSON array output from large models
+            num_predict=planner_output_tokens,
             usage_label="Planner invoke",
         )
         return {
@@ -3238,10 +4099,9 @@ def extract_technical_metadata_for_result(state: RouterState, result: StepResult
     ):
         return [f"Step {step_number} metadata extraction skipped (no output or failure)."]
 
+    metadata_context = build_metadata_context_pack_json(state, result, active_output)
     prompt = (
-        f"Task: {state['task']}\n"
-        f"Subtask: {result['desc']}\n"
-        f"Output: {active_output}\n\n"
+        f"Metadata context JSON:\n{metadata_context}\n\n"
         "Instruction: Extract the 'technical gold' from this output. "
         "Identify: 1. Key architectural decisions, 2. Specific library/tool choices, 3. Critical logic/algorithm details, "
         "4. CAP theorem trade-offs identified, 5. Final outcomes or verified results. "
@@ -3659,18 +4519,7 @@ def route_after_dispatch(state: RouterState) -> str:
 
 
 def build_execution_prompt(state: RouterState, route: Literal["PRO", "FLASH"]) -> str:
-    completed_results = state["results"]
-    completed_context = "\n".join(
-        [
-            f"- Step {result['step']} [{result['route']}]: {result['desc']} => {compact_text(result['output'], 160)}"
-            for result in completed_results
-        ]
-    ) or "None"
-
-    assessment = state["active_subtask"].get("assessment") or {}
-    route_reason = str(assessment.get("reason", "N/A"))
-    route_score = assessment.get("complexity_score", "N/A")
-    route_confidence = assessment.get("confidence", "N/A")
+    context_pack = build_executor_context_pack_json(state, route)
     escalation_context = ""
     if route == PRO and state["active_escalated_from_flash"]:
         flash_review = state["active_flash_review"]
@@ -3688,11 +4537,8 @@ def build_execution_prompt(state: RouterState, route: Literal["PRO", "FLASH"]) -
     return (
         f"Role: {route} task executor.\n"
         f"Execution mode: {mode_instruction}\n"
-        f"Original task: {state['task']}\n"
-        f"Current subtask: {state['active_subtask'].get('desc', 'N/A')}\n"
-        f"Routing rationale: route={route}, score={route_score}, confidence={route_confidence}, reason={route_reason}\n"
+        f"Execution context JSON:\n{context_pack}\n"
         f"{escalation_context}"
-        f"Completed context:\n{completed_context}\n"
         "Return only the result for the current subtask. No markdown fences."
     )
 
@@ -4043,25 +4889,16 @@ def has_distinct_finalizer_model_path(state: RouterState) -> bool:
 
 
 def build_finalizer_prompt(state: RouterState, route: Literal["PRO", "FLASH"]) -> str:
-    results_json = json.dumps(state["results"], ensure_ascii=False, indent=2)
-    
-    # Collect all technical metadata markers from history
-    metadata_blocks = [line for line in state["history"] if "TECHNICAL METADATA STEP" in line]
-    metadata_context = "\n".join(metadata_blocks) if metadata_blocks else "No technical metadata extracted."
-
+    finalizer_context = build_finalizer_context_pack_json(state, route)
     role = "FLASH summarizer" if route == FLASH else "PRO summarizer"
     route_instruction = (
         "Write a concise final report with three sections: Routing Summary, Step Outcomes, Next Action. Use the Technical Metadata blocks for precise facts."
         if route == FLASH
-        else "Write a concise but higher-signal final report with three sections: Routing Summary, Step Outcomes, Next Action. Use the Technical Metadata blocks for precision, but refer back to the Execution Log for full context if needed."
+        else "Write a concise but higher-signal final report with three sections: Routing Summary, Step Outcomes, Next Action. Use the compact execution results and Technical Metadata blocks for precision."
     )
     return (
         f"Role: {role}.\n"
-        f"Original task: {state['task']}\n"
-        f"Planner model: {state['planner_model']}\n"
-        f"Judge model: {state['judge_model']}\n"
-        f"Technical Data Gold:\n{metadata_context}\n\n"
-        f"Execution log JSON:\n{results_json}\n"
+        f"Finalizer context JSON:\n{finalizer_context}\n"
         f"{route_instruction}"
     )
 

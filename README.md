@@ -544,6 +544,12 @@ When running standalone, export them in your shell.
 | `ROUTER_TASK` | unset | Task text used when no positional CLI task is provided. |
 | `ROUTER_MODEL` | unset | Global model default for planner, judge, PRO, and FLASH roles. Role-specific `ROUTER_*_MODEL` values override it. |
 | `ROUTER_PLANNER_MODEL` | `google-gemini-cli/gemini-3-pro-preview` | Model used to decompose the original task into subtasks. |
+| `ROUTER_PLANNER_TASK_CHAR_LIMIT` | `6000` | Character budget for the planner-only context manifest JSON. Long task text is deterministically converted into objective, entity, constraint, deliverable, evidence, and source-brief fields before planner invocation. |
+| `ROUTER_PLANNER_MAX_OUTPUT_TOKENS` | `4096` | Maximum generated tokens requested from the planner for the JSON subtask list. |
+| `ROUTER_JUDGE_CONTEXT_CHAR_LIMIT` | `3000` | Character budget for the judge context JSON. Defaults are automatically expanded for high-risk tasks unless explicitly set. |
+| `ROUTER_EXECUTOR_CONTEXT_CHAR_LIMIT` | `8000` | Character budget for executor context JSON, including scoped task context, routing rationale, escalation details, and compact prior results. |
+| `ROUTER_METADATA_OUTPUT_CHAR_LIMIT` | `6000` | Character budget for metadata extraction context JSON and bounded executor output excerpts. |
+| `ROUTER_FINALIZER_CONTEXT_CHAR_LIMIT` | `12000` | Character budget for finalizer context JSON, including compact task context, technical metadata, and compact execution results. |
 | `ROUTER_JUDGE_MODEL` | `google-gemini-cli/gemini-3-flash-preview` | Model used for structured complexity scoring. |
 | `ROUTER_PRO_MODEL` | `google-gemini-cli/gemini-3-pro-preview` | Primary heavy reasoning executor and PRO finalizer model. |
 | `ROUTER_FLASH_MODEL` | `google-gemini-cli/gemini-3-flash-preview` | Primary fast executor and FLASH finalizer model. |

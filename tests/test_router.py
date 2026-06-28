@@ -204,6 +204,227 @@ class RouterHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             r.extract_first_json_array("no json here")
 
+    def test_planner_prompt_compacts_long_task_and_preserves_constraints(self):
+        noisy_context = "\n".join(
+            f"raw retrieved log line {index}: repeated low-value evidence blob"
+            for index in range(120)
+        )
+        task = (
+            "Investigate the production payments incident across checkout, ledger, fraud, and Kafka.\n"
+            f"{noisy_context}\n"
+            "MUST preserve the rollback safety constraint and PCI logging requirement.\n"
+            "Required output: final incident-commander-ready summary table."
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {r.ROUTER_PLANNER_TASK_CHAR_LIMIT_ENV_VAR: "700"},
+            clear=False,
+        ):
+            prompt = r.build_planner_prompt(task)
+
+        self.assertLess(len(prompt), len(task))
+        self.assertLess(len(prompt), 1600)
+        self.assertIn("Planner context manifest compacted", prompt)
+        self.assertIn("Planner context manifest JSON:", prompt)
+        self.assertIn("\"constraints\":", prompt)
+        self.assertIn("production payments incident", prompt)
+        self.assertIn("rollback safety constraint", prompt)
+        self.assertIn("PCI logging requirement", prompt)
+        self.assertIn("incident-commander-ready summary table", prompt)
+        self.assertNotIn("raw retrieved log line 60", prompt)
+        self.assertIn("Return raw JSON only", prompt)
+
+    def test_planner_context_manifest_preserves_middle_entities_and_constraints(self):
+        noisy_context = "\n".join(
+            f"low value transcript line {index}: repeated context blob"
+            for index in range(80)
+        )
+        task = (
+            "Analyze a production payments incident.\n"
+            f"{noisy_context}\n"
+            "Technical areas: checkout authorization, ledger settlement, fraud scoring, "
+            "Kafka idempotency, Redis invalidation, PostgreSQL consistency.\n"
+            "MUST preserve rollback safety and PCI logging.\n"
+            "Required output: exactly six independent subtasks plus incident-commander summary table."
+        )
+
+        manifest_a = r.build_planner_context_manifest(task, 1500)
+        manifest_b = r.build_planner_context_manifest(task, 1500)
+        parsed_manifest = json.loads(manifest_a)
+
+        self.assertEqual(manifest_a, manifest_b)
+        self.assertLessEqual(len(manifest_a), 1500)
+        self.assertEqual(
+            list(parsed_manifest),
+            [
+                "original_chars",
+                "objective",
+                "entities",
+                "constraints",
+                "deliverables",
+                "evidence_requirements",
+                "decomposition_hints",
+                "source_brief",
+            ],
+        )
+        self.assertIn("checkout authorization", parsed_manifest["entities"])
+        self.assertIn("PostgreSQL consistency", parsed_manifest["entities"])
+        self.assertIn("rollback safety", "\n".join(parsed_manifest["constraints"]))
+        self.assertIn("PCI logging", "\n".join(parsed_manifest["constraints"]))
+        self.assertIn("exactly six independent subtasks", "\n".join(parsed_manifest["deliverables"]))
+        self.assertNotIn("low value transcript line 40", manifest_a)
+
+    def test_planner_invoke_uses_configurable_output_cap(self):
+        captured = {}
+
+        def fake_generate_text(model, prompt, *, timeout, num_predict, usage_label):
+            captured["model"] = model
+            captured["prompt"] = prompt
+            captured["timeout"] = timeout
+            captured["num_predict"] = num_predict
+            captured["usage_label"] = usage_label
+            return "[{\"desc\":\"Inspect planner output cap\"}]"
+
+        state = r.create_initial_state(
+            "Inspect planner output cap",
+            planner_model="planner",
+            judge_model="judge",
+            pro_model="pro",
+            flash_model="flash",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {r.ROUTER_PLANNER_MAX_OUTPUT_TOKENS_ENV_VAR: "123"},
+            clear=False,
+        ), mock.patch.object(r, "generate_text", side_effect=fake_generate_text):
+            result, _ = run_quietly(r.planner_invoke_node, state)
+
+        self.assertEqual(result["planner_raw_text"], "[{\"desc\":\"Inspect planner output cap\"}]")
+        self.assertEqual(result["status"], "planner_invoked")
+        self.assertEqual(captured["model"], "planner")
+        self.assertEqual(captured["num_predict"], 123)
+        self.assertEqual(captured["usage_label"], "Planner invoke")
+
+    def test_downstream_context_packs_are_json_bounded_and_preserve_requirements(self):
+        noisy_task = "\n".join(
+            f"unrelated raw conversation line {index}: repeated low-value context"
+            for index in range(100)
+        )
+        task = (
+            "Investigate a production payments incident.\n"
+            f"{noisy_task}\n"
+            "Technical areas: checkout authorization, ledger settlement, Kafka idempotency.\n"
+            "MUST preserve rollback safety and PCI logging.\n"
+            "Required output: incident commander summary table."
+        )
+        subtask_desc = "Inspect checkout authorization and rollback safety evidence"
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                r.ROUTER_JUDGE_CONTEXT_CHAR_LIMIT_ENV_VAR: "1500",
+                r.ROUTER_EXECUTOR_CONTEXT_CHAR_LIMIT_ENV_VAR: "2200",
+                r.ROUTER_METADATA_OUTPUT_CHAR_LIMIT_ENV_VAR: "1800",
+                r.ROUTER_FINALIZER_CONTEXT_CHAR_LIMIT_ENV_VAR: "2600",
+            },
+            clear=False,
+        ):
+            judge_prompt = r.build_judge_prompt(task, subtask_desc)
+            judge_context = json.loads(
+                judge_prompt.split("Task context JSON:\n", 1)[1].split("\nSubtask:", 1)[0]
+            )
+
+            state = r.create_initial_state(task, pro_model="pro", flash_model="flash")
+            state["active_subtask"] = {
+                "desc": subtask_desc,
+                "model": r.PRO,
+                "assessment": {
+                    "scores": {
+                        "reasoning_depth": 2,
+                        "code_change_scope": 0,
+                        "ambiguity": 1,
+                        "risk": 2,
+                        "io_heaviness": 1,
+                    },
+                    "complexity_score": 6,
+                    "suggested_route": r.PRO,
+                    "final_route": r.PRO,
+                    "confidence": 0.9,
+                    "reason": "high-risk diagnosis",
+                    "judge_source": "test",
+                },
+            }
+            state["active_route"] = r.PRO
+            state["results"] = [
+                {
+                    "step": 1,
+                    "planned_route": r.PRO,
+                    "route": r.PRO,
+                    "model_name": "pro",
+                    "desc": "Collect ledger evidence",
+                    "output": "\n".join(
+                        f"verbose executor output line {index}: low-value transcript"
+                        for index in range(80)
+                    ),
+                    "status": "executed",
+                    "attempt_count": 1,
+                    "retry_count": 0,
+                    "escalated_from_flash": False,
+                    "used_provider_fallback": False,
+                    "flash_review": r.empty_flash_review(),
+                    "attempt_log": [],
+                }
+            ]
+            executor_prompt = r.build_execution_prompt(state, r.PRO)
+            executor_context = json.loads(
+                executor_prompt.split("Execution context JSON:\n", 1)[1].split(
+                    "\nReturn only the result",
+                    1,
+                )[0]
+            )
+
+            metadata_output = "\n".join(
+                f"metadata candidate output line {index}: low-value transcript"
+                for index in range(100)
+            )
+            metadata_context = json.loads(
+                r.build_metadata_context_pack_json(state, state["results"][0], metadata_output)
+            )
+
+            state["history"] = [
+                "--- TECHNICAL METADATA STEP 1 ---\ncheckout authorization evidence was validated.\n---"
+            ]
+            finalizer_prompt = r.build_finalizer_prompt(state, r.PRO)
+            finalizer_context = json.loads(
+                finalizer_prompt.split("Finalizer context JSON:\n", 1)[1].split(
+                    "\nWrite a concise",
+                    1,
+                )[0]
+            )
+
+        self.assertLessEqual(len(json.dumps(judge_context, ensure_ascii=False, indent=2)), 1500)
+        self.assertIn("checkout authorization", judge_context["entities"])
+        self.assertIn("rollback safety", "\n".join(judge_context["constraints"]))
+        self.assertTrue(judge_context["risk_context"]["high_risk"])
+        self.assertNotIn("unrelated raw conversation line 50", judge_prompt)
+        self.assertNotIn("Original task:", judge_prompt)
+
+        self.assertIn("task_context", executor_context)
+        self.assertIn("prior_results", executor_context)
+        self.assertIn("rollback safety", "\n".join(executor_context["task_context"]["constraints"]))
+        self.assertNotIn("verbose executor output line 40", executor_prompt)
+        self.assertNotIn("Original task:", executor_prompt)
+
+        self.assertIn("output_excerpt", metadata_context)
+        self.assertIn("checkout authorization", metadata_context["task_context"]["entities"])
+        self.assertNotIn("metadata candidate output line 50", json.dumps(metadata_context))
+
+        self.assertIn("execution_results", finalizer_context)
+        self.assertIn("TECHNICAL METADATA STEP", "\n".join(finalizer_context["technical_metadata"]))
+        self.assertNotIn("unrelated raw conversation line 50", finalizer_prompt)
+        self.assertNotIn("Original task:", finalizer_prompt)
+
     def test_communication_subtask_split_and_route_biases(self):
         task = "Debug intermittent API failure and send a concise team update."
         planned = [{"desc": "Debug intermittent API failure and send a concise team update"}]
@@ -788,7 +1009,11 @@ class RouterGraphIntegrationTests(unittest.TestCase):
     def fake_generate_success(self, model, prompt, **kwargs):
         if prompt == "OK":
             return "OK"
-        if "Task Decomposer" in prompt or "Role: Expert task decomposer" in prompt:
+        if (
+            "Task Decomposer" in prompt
+            or "Role: Expert task decomposer" in prompt
+            or "Role: Task decomposition planner" in prompt
+        ):
             return '[{"desc":"Inspect the router state flow"},{"desc":"Prepare a concise summary"}]'
         if "Role: Complexity judge" in prompt:
             if "Prepare a concise summary" in prompt:
@@ -840,7 +1065,11 @@ class RouterGraphIntegrationTests(unittest.TestCase):
         def fake_generate(model, prompt, **kwargs):
             if prompt == "OK":
                 return "OK"
-            if "Task Decomposer" in prompt or "Role: Expert task decomposer" in prompt:
+            if (
+                "Task Decomposer" in prompt
+                or "Role: Expert task decomposer" in prompt
+                or "Role: Task decomposition planner" in prompt
+            ):
                 return '[{"desc":"List deployment manifests"}]'
             if "Role: Complexity judge" in prompt:
                 return (
@@ -892,7 +1121,7 @@ class RouterGraphIntegrationTests(unittest.TestCase):
         def fake_generate(model, prompt, **kwargs):
             if prompt == "OK":
                 return "OK"
-            if "Task Decomposer" in prompt:
+            if "Task Decomposer" in prompt or "Role: Task decomposition planner" in prompt:
                 return (
                     '[{"desc":"Analyze provider A architecture"},'
                     '{"desc":"Analyze provider B architecture"}]'

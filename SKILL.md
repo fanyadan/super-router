@@ -148,6 +148,12 @@ All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime 
 |----------|---------|---------|
 | `ROUTER_MODEL` | Global model default for planner, judge, PRO, and FLASH roles | None |
 | `ROUTER_PLANNER_MODEL` | Task decomposition model | internal default |
+| `ROUTER_PLANNER_TASK_CHAR_LIMIT` | Character budget for the compact planner-only context manifest JSON | 6000 |
+| `ROUTER_PLANNER_MAX_OUTPUT_TOKENS` | Planner JSON subtask output token cap | 4096 |
+| `ROUTER_JUDGE_CONTEXT_CHAR_LIMIT` | Character budget for judge context JSON | 3000 |
+| `ROUTER_EXECUTOR_CONTEXT_CHAR_LIMIT` | Character budget for executor context JSON | 8000 |
+| `ROUTER_METADATA_OUTPUT_CHAR_LIMIT` | Character budget for metadata extraction context JSON and output excerpts | 6000 |
+| `ROUTER_FINALIZER_CONTEXT_CHAR_LIMIT` | Character budget for finalizer context JSON | 12000 |
 | `ROUTER_JUDGE_MODEL` | Complexity scoring model | internal default |
 | `ROUTER_PRO_MODEL` | Heavy reasoning executor | internal default |
 | `ROUTER_FLASH_MODEL` | Fast executor | internal default |
