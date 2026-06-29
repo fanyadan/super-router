@@ -601,8 +601,12 @@ class RouterHelperTests(unittest.TestCase):
             stdout = json.dumps(
                 {
                     "result": "ok",
-                    "total_input_tokens": 5,
-                    "total_output_tokens": 6,
+                    "usage": {
+                        "input_tokens": 5,
+                        "output_tokens": 6,
+                        "cache_creation_input_tokens": 2,
+                        "cache_read_input_tokens": 3,
+                    },
                 }
             )
             stderr = ""
@@ -628,7 +632,12 @@ class RouterHelperTests(unittest.TestCase):
         self.assertEqual(result["text"], "ok")
         self.assertEqual(
             result["usage_metadata"],
-            {"input_tokens": 5, "output_tokens": 6, "total_tokens": 11},
+            {
+                "input_tokens": 5,
+                "output_tokens": 6,
+                "total_tokens": 11,
+                "cached_tokens": 5,
+            },
         )
         self.assertEqual(
             captured["command"],
@@ -636,6 +645,36 @@ class RouterHelperTests(unittest.TestCase):
         )
         self.assertEqual(captured["timeout"], 30)
         self.assertEqual(captured["env"]["NO_COLOR"], "1")
+
+    def test_extract_claude_usage_metadata_accepts_model_usage_and_legacy_fields(self):
+        self.assertEqual(
+            r.extract_claude_usage_metadata(
+                {
+                    "model_usage": {
+                        "sonnet": {
+                            "inputTokens": 7,
+                            "outputTokens": 8,
+                            "cacheCreationInputTokens": 2,
+                            "cacheReadInputTokens": 4,
+                        }
+                    }
+                },
+                "sonnet",
+            ),
+            {
+                "input_tokens": 7,
+                "output_tokens": 8,
+                "total_tokens": 15,
+                "cached_tokens": 6,
+            },
+        )
+        self.assertEqual(
+            r.extract_claude_usage_metadata(
+                {"result": "ok", "total_input_tokens": 5, "total_output_tokens": 6},
+                "sonnet",
+            ),
+            {"input_tokens": 5, "output_tokens": 6, "total_tokens": 11},
+        )
 
     def test_provider_usage_metadata_extraction(self):
         class FakeResponse:

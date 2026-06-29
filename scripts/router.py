@@ -3217,6 +3217,95 @@ def codex_generate(
     )["text"]
 
 
+def sum_optional_ints(values: List[Any]) -> int | None:
+    total = 0
+    found = False
+    for value in values:
+        count = coerce_non_negative_int(value)
+        if count is None:
+            continue
+        total += count
+        found = True
+    return total if found else None
+
+
+def extract_claude_usage_metadata(parsed: Dict[str, Any], normalized_model: str) -> Dict[str, int]:
+    usage = parsed.get("usage")
+    if isinstance(usage, dict):
+        cache_creation_tokens = first_present_value(
+            usage,
+            ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+        )
+        cache_read_tokens = first_present_value(
+            usage,
+            ("cache_read_input_tokens", "cacheReadInputTokens"),
+        )
+        return normalize_usage_metadata(
+            input_tokens=first_present_value(usage, ("input_tokens", "inputTokens")),
+            output_tokens=first_present_value(usage, ("output_tokens", "outputTokens")),
+            total_tokens=first_present_value(usage, ("total_tokens", "totalTokens")),
+            cached_tokens=sum_optional_ints([cache_creation_tokens, cache_read_tokens]),
+        )
+
+    model_usage = parsed.get("model_usage") or parsed.get("modelUsage")
+    if isinstance(model_usage, dict):
+        model_entry = model_usage.get(normalized_model)
+        entries = (
+            [model_entry]
+            if isinstance(model_entry, dict)
+            else [entry for entry in model_usage.values() if isinstance(entry, dict)]
+        )
+        if entries:
+            input_tokens = sum_optional_ints(
+                [first_present_value(entry, ("inputTokens", "input_tokens")) for entry in entries]
+            )
+            output_tokens = sum_optional_ints(
+                [first_present_value(entry, ("outputTokens", "output_tokens")) for entry in entries]
+            )
+            cache_creation_tokens = sum_optional_ints(
+                [
+                    first_present_value(
+                        entry,
+                        ("cacheCreationInputTokens", "cache_creation_input_tokens"),
+                    )
+                    for entry in entries
+                ]
+            )
+            cache_read_tokens = sum_optional_ints(
+                [
+                    first_present_value(
+                        entry,
+                        ("cacheReadInputTokens", "cache_read_input_tokens"),
+                    )
+                    for entry in entries
+                ]
+            )
+            total_tokens = sum_optional_ints(
+                [first_present_value(entry, ("totalTokens", "total_tokens")) for entry in entries]
+            )
+            return normalize_usage_metadata(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cached_tokens=sum_optional_ints([cache_creation_tokens, cache_read_tokens]),
+            )
+
+    cache_creation_tokens = first_present_value(
+        parsed,
+        ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+    )
+    cache_read_tokens = first_present_value(
+        parsed,
+        ("cache_read_input_tokens", "cacheReadInputTokens"),
+    )
+    return normalize_usage_metadata(
+        input_tokens=first_present_value(parsed, ("total_input_tokens", "input_tokens", "inputTokens")),
+        output_tokens=first_present_value(parsed, ("total_output_tokens", "output_tokens", "outputTokens")),
+        total_tokens=first_present_value(parsed, ("total_tokens", "totalTokens")),
+        cached_tokens=sum_optional_ints([cache_creation_tokens, cache_read_tokens]),
+    )
+
+
 def claude_generate_with_usage(
     model: str,
     prompt: str,
@@ -3266,10 +3355,7 @@ def claude_generate_with_usage(
     if not text.strip():
         raise RuntimeError(f"Claude CLI returned an empty response for model {normalized_model}")
 
-    usage = normalize_usage_metadata(
-        input_tokens=parsed.get("total_input_tokens"),
-        output_tokens=parsed.get("total_output_tokens"),
-    )
+    usage = extract_claude_usage_metadata(parsed, normalized_model)
     return build_text_generation_result(
         text.strip(),
         usage or {},
