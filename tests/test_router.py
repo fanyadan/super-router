@@ -198,11 +198,48 @@ class RouterHelperTests(unittest.TestCase):
         self.assertEqual(r.extract_first_json_object("noise {\"confidence\": 0.8}"), {"confidence": 0.8})
         self.assertEqual(
             r.normalize_planned_subtasks([{"step": "Inspect"}, "Summarize", {"desc": ""}]),
-            [{"desc": "Inspect"}, {"desc": "Summarize"}],
+            [
+                {
+                    "id": "S1",
+                    "desc": "Inspect",
+                    "depends_on": [],
+                    "dependency_reason": "Dependency not specified by planner.",
+                },
+                {
+                    "id": "S2",
+                    "desc": "Summarize",
+                    "depends_on": [],
+                    "dependency_reason": "Dependency not specified by planner.",
+                },
+            ],
         )
 
         with self.assertRaises(ValueError):
             r.extract_first_json_array("no json here")
+
+    def test_dependency_judgment_can_remove_planner_dependency(self):
+        planned = r.normalize_planned_subtasks(
+            [
+                {"id": "S1", "desc": "Inspect A", "depends_on": []},
+                {"id": "S2", "desc": "Inspect B", "depends_on": ["S1"]},
+            ]
+        )
+        judged, confidence, issues = r.normalize_dependency_judgment(
+            {
+                "subtasks": [
+                    {"id": "S1", "depends_on": [], "dependency_reason": "A is independent."},
+                    {"id": "S2", "depends_on": [], "dependency_reason": "B is independent."},
+                ],
+                "confidence": 0.91,
+                "issues": [],
+            },
+            planned,
+        )
+
+        self.assertEqual(judged[1]["depends_on"], [])
+        self.assertEqual(judged[1]["dependency_reason"], "B is independent.")
+        self.assertEqual(confidence, 0.91)
+        self.assertEqual(issues, [])
 
     def test_planner_prompt_compacts_long_task_and_preserves_constraints(self):
         noisy_context = "\n".join(
@@ -1015,6 +1052,13 @@ class RouterGraphIntegrationTests(unittest.TestCase):
             or "Role: Task decomposition planner" in prompt
         ):
             return '[{"desc":"Inspect the router state flow"},{"desc":"Prepare a concise summary"}]'
+        if "Role: Dependency judge" in prompt:
+            return (
+                '{"subtasks":['
+                '{"id":"S1","depends_on":[],"dependency_reason":"Inspection can run first."},'
+                '{"id":"S2","depends_on":["S1"],"dependency_reason":"Summary needs inspection findings."}'
+                '],"confidence":0.95,"issues":[]}'
+            )
         if "Role: Complexity judge" in prompt:
             if "Prepare a concise summary" in prompt:
                 return (
@@ -1126,6 +1170,13 @@ class RouterGraphIntegrationTests(unittest.TestCase):
                     '[{"desc":"Analyze provider A architecture"},'
                     '{"desc":"Analyze provider B architecture"}]'
                 )
+            if "Role: Dependency judge" in prompt:
+                return (
+                    '{"subtasks":['
+                    '{"id":"S1","depends_on":[],"dependency_reason":"Provider A is independent."},'
+                    '{"id":"S2","depends_on":[],"dependency_reason":"Provider B is independent."}'
+                    '],"confidence":0.94,"issues":[]}'
+                )
             if "Role: Complexity judge" in prompt:
                 return (
                     '{"scores":{"reasoning_depth":2,"code_change_scope":0,"ambiguity":1,'
@@ -1165,6 +1216,84 @@ class RouterGraphIntegrationTests(unittest.TestCase):
         self.assertEqual([result["step"] for result in state["results"]], [1, 2])
         self.assertFalse(broken_barrier)
         self.assertEqual(len(set(executor_threads)), 2)
+
+    def test_dependency_judge_blocks_dependent_subtask_until_dependencies_finish(self):
+        barrier = threading.Barrier(2, timeout=3)
+        broken_barrier = []
+        executor_threads = []
+        compare_prompts = []
+
+        def fake_generate(model, prompt, **kwargs):
+            if prompt == "OK":
+                return "OK"
+            if "Task Decomposer" in prompt or "Role: Task decomposition planner" in prompt:
+                return (
+                    '[{"id":"S1","desc":"Analyze provider A architecture","depends_on":[]},'
+                    '{"id":"S2","desc":"Analyze provider B architecture","depends_on":[]},'
+                    '{"id":"S3","desc":"Compare provider findings","depends_on":[]}]'
+                )
+            if "Role: Dependency judge" in prompt:
+                return (
+                    '{"subtasks":['
+                    '{"id":"S1","depends_on":[],"dependency_reason":"Provider A can be analyzed independently."},'
+                    '{"id":"S2","depends_on":[],"dependency_reason":"Provider B can be analyzed independently."},'
+                    '{"id":"S3","depends_on":["S1","S2"],'
+                    '"dependency_reason":"Comparison needs both provider analyses."}'
+                    '],"confidence":0.97,"issues":[]}'
+                )
+            if "Role: Complexity judge" in prompt:
+                return (
+                    '{"scores":{"reasoning_depth":2,"code_change_scope":0,"ambiguity":1,'
+                    '"risk":0,"io_heaviness":0},"suggested_route":"PRO",'
+                    '"confidence":0.9,"reason":"technical analysis"}'
+                )
+            if "Role: PRO task executor" in prompt:
+                if "Compare provider findings" in prompt:
+                    compare_prompts.append(prompt)
+                    self.assertIn("Provider A output from executor", prompt)
+                    self.assertIn("Provider B output from executor", prompt)
+                    return "Comparison output used both provider dependency results."
+                if "Analyze provider A architecture" in prompt:
+                    executor_threads.append(threading.get_ident())
+                    try:
+                        barrier.wait()
+                    except threading.BrokenBarrierError:
+                        broken_barrier.append("provider analysis branches did not overlap")
+                    return "Provider A output from executor with detailed architecture evidence."
+                if "Analyze provider B architecture" in prompt:
+                    executor_threads.append(threading.get_ident())
+                    try:
+                        barrier.wait()
+                    except threading.BrokenBarrierError:
+                        broken_barrier.append("provider analysis branches did not overlap")
+                    return "Provider B output from executor with detailed architecture evidence."
+            if "Extract the 'technical gold'" in prompt:
+                return "- Dependency-aware branch metadata was extracted."
+            if "summarizer" in prompt:
+                return (
+                    "Routing Summary\nDependency-aware execution completed.\n"
+                    "Step Outcomes\nIndependent analyses ran before comparison.\n"
+                    "Next Action\nUse the comparison result."
+                )
+            return "Fallback mocked output with sufficient detail."
+
+        with mock.patch.object(r, "generate_text", side_effect=fake_generate):
+            state, _ = run_quietly(
+                r.run_router_app,
+                "Analyze provider A and provider B, then compare them",
+                planner_model="mock-planner",
+                judge_model="mock-judge",
+                pro_model="mock-pro",
+                flash_model="mock-flash",
+                max_concurrency=2,
+            )
+
+        self.assertEqual(state["status"], "finished")
+        self.assertEqual([result["subtask_id"] for result in state["results"]], ["S1", "S2", "S3"])
+        self.assertEqual(state["results"][2]["depends_on"], ["S1", "S2"])
+        self.assertEqual(len(set(executor_threads)), 2)
+        self.assertFalse(broken_barrier)
+        self.assertEqual(len(compare_prompts), 1)
 
     def test_streamed_graph_returns_final_state(self):
         with mock.patch.object(r, "generate_text", side_effect=self.fake_generate_success):

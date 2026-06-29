@@ -392,7 +392,10 @@ TOKEN_USAGE_ACTIVE_RUN_IDS: set[str] = set()
 
 
 class PlannedSubtask(TypedDict):
+    id: str
     desc: str
+    depends_on: List[str]
+    dependency_reason: str
 
 
 class ComplexityScores(TypedDict):
@@ -493,7 +496,10 @@ class FinalizerOutcome(TypedDict):
 
 
 class Subtask(TypedDict):
+    id: str
     desc: str
+    depends_on: List[str]
+    dependency_reason: str
     model: Literal["PRO", "FLASH"]
     assessment: ComplexityAssessment
 
@@ -506,6 +512,8 @@ class JudgedSubtask(TypedDict):
 
 class StepResult(TypedDict):
     step: int
+    subtask_id: str
+    depends_on: List[str]
     planned_route: Literal["PRO", "FLASH"]
     route: Literal["PRO", "FLASH"]
     model_name: str
@@ -533,6 +541,10 @@ class RouterState(TypedDict):
     planned_subtasks: List[PlannedSubtask]
     planner_raw_text: str
     planner_error: str
+    dependency_raw_text: str
+    dependency_error: str
+    dependency_issues: List[str]
+    dependency_confidence: float
     planner_warmup_attempt: int
     judge_warmup_done: bool
     subtasks: List[Subtask]
@@ -1257,6 +1269,8 @@ def build_judge_context_pack_json(task: str, subtask_desc: str) -> str:
 def compact_step_result_for_context(result: StepResult, output_limit: int) -> Dict[str, Any]:
     return {
         "step": result["step"],
+        "subtask_id": result.get("subtask_id", ""),
+        "depends_on": list(result.get("depends_on", [])),
         "planned_route": result["planned_route"],
         "actual_route": result["route"],
         "model_name": result["model_name"],
@@ -1298,6 +1312,12 @@ def build_executor_context_payload(
             "score": assessment.get("complexity_score", "N/A"),
             "confidence": assessment.get("confidence", "N/A"),
             "reason": str(assessment.get("reason", "N/A")),
+        },
+        "dependency_context": {
+            "subtask_id": state["active_subtask"].get("id", ""),
+            "depends_on": list(state["active_subtask"].get("depends_on", [])),
+            "dependency_reason": str(state["active_subtask"].get("dependency_reason", "")),
+            "prior_results_are_direct_dependencies": True,
         },
         "prior_results": [
             compact_step_result_for_context(result, prior_output_limit)
@@ -3382,27 +3402,233 @@ def extract_first_json_object(text: str) -> Dict[str, Any]:
     raise ValueError("No valid JSON object found in judge output")
 
 
+def normalize_dependency_id(value: Any, fallback: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        raw = fallback
+    normalized = re.sub(r"[^A-Za-z0-9_.:-]+", "_", raw).strip("_")
+    return normalized or fallback
+
+
+def normalize_dependency_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, str):
+        stripped = value.strip()
+        raw_items = re.split(r"[\s,]+", stripped) if stripped else []
+    else:
+        raw_items = [value]
+
+    dependencies: List[str] = []
+    for item in raw_items:
+        dependency_id = normalize_dependency_id(item, "")
+        if dependency_id and dependency_id not in dependencies:
+            dependencies.append(dependency_id)
+    return dependencies
+
+
+def dependency_reason_from_raw(raw: Any, default: str) -> str:
+    if isinstance(raw, dict):
+        reason = (
+            raw.get("dependency_reason")
+            or raw.get("depends_reason")
+            or raw.get("reason")
+            or raw.get("dependency")
+        )
+        if reason:
+            return compact_text(str(reason), 220)
+    return default
+
+
 def normalize_planned_subtasks(raw_subtasks: List[Any]) -> List[PlannedSubtask]:
-    normalized: List[PlannedSubtask] = []
+    pending: List[Dict[str, Any]] = []
+    used_ids: set[str] = set()
+    id_aliases: Dict[str, str] = {}
+
     for item in raw_subtasks:
         if isinstance(item, dict):
             desc = str(item.get("desc") or item.get("description") or item.get("step") or "").strip()
+            raw_id = item.get("id") or item.get("step_id") or item.get("name")
+            raw_depends_on = item.get("depends_on") or item.get("dependencies") or item.get("requires")
         else:
             desc = str(item).strip()
+            raw_id = None
+            raw_depends_on = []
 
         if not desc:
             continue
 
-        normalized.append({"desc": desc})
+        fallback_id = f"S{len(pending) + 1}"
+        subtask_id = normalize_dependency_id(raw_id, fallback_id)
+        if subtask_id in used_ids:
+            subtask_id = fallback_id
+            suffix = 2
+            while subtask_id in used_ids:
+                subtask_id = f"{fallback_id}_{suffix}"
+                suffix += 1
+        used_ids.add(subtask_id)
+        if raw_id:
+            id_aliases[str(raw_id).strip()] = subtask_id
+            id_aliases[normalize_dependency_id(raw_id, subtask_id)] = subtask_id
+
+        pending.append(
+            {
+                "id": subtask_id,
+                "desc": desc,
+                "raw_depends_on": raw_depends_on,
+                "dependency_reason": dependency_reason_from_raw(
+                    item,
+                    "Dependency not specified by planner.",
+                ),
+            }
+        )
+
+    normalized: List[PlannedSubtask] = []
+    for item in pending:
+        dependencies: List[str] = []
+        for dependency_id in normalize_dependency_list(item["raw_depends_on"]):
+            resolved_dependency_id = id_aliases.get(dependency_id, dependency_id)
+            if resolved_dependency_id != item["id"] and resolved_dependency_id not in dependencies:
+                dependencies.append(resolved_dependency_id)
+        normalized.append(
+            {
+                "id": item["id"],
+                "desc": item["desc"],
+                "depends_on": dependencies,
+                "dependency_reason": item["dependency_reason"],
+            }
+        )
 
     if not normalized:
         raise ValueError("Planner did not return any usable subtasks")
     return normalized
 
 
+def validate_dependency_graph(subtasks: List[PlannedSubtask]) -> List[PlannedSubtask]:
+    ids = [subtask["id"] for subtask in subtasks]
+    duplicate_ids = sorted({subtask_id for subtask_id in ids if ids.count(subtask_id) > 1})
+    if duplicate_ids:
+        raise ValueError(f"Duplicate dependency ids: {', '.join(duplicate_ids)}")
+
+    known_ids = set(ids)
+    for subtask in subtasks:
+        if not subtask["id"]:
+            raise ValueError("Dependency graph contains an empty subtask id")
+        missing = [dependency_id for dependency_id in subtask["depends_on"] if dependency_id not in known_ids]
+        if missing:
+            raise ValueError(
+                f"Subtask {subtask['id']} references unknown dependencies: {', '.join(missing)}"
+            )
+        if subtask["id"] in subtask["depends_on"]:
+            raise ValueError(f"Subtask {subtask['id']} depends on itself")
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    by_id = {subtask["id"]: subtask for subtask in subtasks}
+
+    def visit(subtask_id: str, path: List[str]) -> None:
+        if subtask_id in visited:
+            return
+        if subtask_id in visiting:
+            cycle = " -> ".join(path + [subtask_id])
+            raise ValueError(f"Dependency cycle detected: {cycle}")
+        visiting.add(subtask_id)
+        for dependency_id in by_id[subtask_id]["depends_on"]:
+            visit(dependency_id, path + [subtask_id])
+        visiting.remove(subtask_id)
+        visited.add(subtask_id)
+
+    for subtask_id in ids:
+        visit(subtask_id, [])
+
+    return subtasks
+
+
+def make_serial_dependency_plan(
+    subtasks: List[PlannedSubtask],
+    *,
+    reason: str = "Conservative serial fallback after invalid dependency judgment.",
+) -> List[PlannedSubtask]:
+    serial_subtasks: List[PlannedSubtask] = []
+    previous_id = ""
+    for subtask in subtasks:
+        serial_subtasks.append(
+            {
+                **subtask,
+                "depends_on": [previous_id] if previous_id else [],
+                "dependency_reason": reason if previous_id else "First serial fallback step has no dependency.",
+            }
+        )
+        previous_id = subtask["id"]
+    return serial_subtasks
+
+
+def normalize_dependency_judgment(
+    raw: Dict[str, Any],
+    planned_subtasks: List[PlannedSubtask],
+) -> tuple[List[PlannedSubtask], float, List[str]]:
+    raw_subtasks = raw.get("subtasks") or raw.get("planned_subtasks") or raw.get("plan")
+    raw_dependencies = raw.get("dependencies")
+    updates: Dict[str, Dict[str, Any]] = {}
+
+    if isinstance(raw_subtasks, list):
+        for item in raw_subtasks:
+            if not isinstance(item, dict):
+                continue
+            subtask_id = normalize_dependency_id(
+                item.get("id") or item.get("step_id") or item.get("name"),
+                "",
+            )
+            if subtask_id:
+                updates[subtask_id] = item
+
+    if isinstance(raw_dependencies, dict):
+        for raw_id, raw_depends_on in raw_dependencies.items():
+            subtask_id = normalize_dependency_id(raw_id, "")
+            if not subtask_id:
+                continue
+            updates.setdefault(subtask_id, {})["depends_on"] = raw_depends_on
+
+    judged: List[PlannedSubtask] = []
+    for planned in planned_subtasks:
+        update = updates.get(planned["id"], {})
+        dependency_value = planned["depends_on"]
+        for key in ("depends_on", "dependencies", "requires"):
+            if key in update:
+                dependency_value = update[key]
+                break
+        dependencies = normalize_dependency_list(dependency_value)
+        dependencies = [
+            dependency_id
+            for dependency_id in dependencies
+            if dependency_id != planned["id"]
+        ]
+        judged.append(
+            {
+                **planned,
+                "depends_on": dependencies,
+                "dependency_reason": dependency_reason_from_raw(
+                    update,
+                    planned["dependency_reason"],
+                ),
+            }
+        )
+
+    confidence = clamp_float(raw.get("confidence"), 0.0, 1.0, default=0.5)
+    raw_issues = raw.get("issues")
+    issues = [
+        compact_text(str(issue), 220)
+        for issue in raw_issues
+        if str(issue).strip()
+    ] if isinstance(raw_issues, list) else []
+    return judged, confidence, issues
+
+
 def build_fallback_subtasks(task: str) -> List[PlannedSubtask]:
     lowered = task.lower()
-    subtasks: List[PlannedSubtask] = []
+    subtasks: List[Any] = []
 
     if any(
         keyword in lowered
@@ -3447,7 +3673,7 @@ def build_fallback_subtasks(task: str) -> List[PlannedSubtask]:
     ):
         subtasks.append({"desc": "整理执行结果并生成最终总结或输出。"})
 
-    return subtasks
+    return normalize_planned_subtasks(subtasks)
 
 
 def build_planner_prompt(task: str) -> str:
@@ -3472,14 +3698,68 @@ def build_planner_prompt(task: str) -> str:
         "Planner context manifest JSON:\n"
         f"{planner_context}\n"
         "Rules:\n"
-        "- Split by independent entity, component, file, provider, region, backend, or technical area.\n"
-        "- Keep investigation, implementation, validation, and reporting/update work as separate subtasks when mixed.\n"
-        "- For research or analysis, ask for metrics, versions, hard limits, citations, files, or commands when relevant.\n"
-        "- Preserve required deliverables and constraints.\n"
-        "- Do not assign model labels, complexity labels, or scores.\n"
-        "Return raw JSON only: [{\"desc\":\"atomic actionable subtask\"}]\n"
+        "- Split by independent entity/component/file/provider/region/backend/technical area.\n"
+        "- Separate investigation/implementation/validation/reporting when mixed.\n"
+        "- Preserve deliverables, constraints, and needed evidence.\n"
+        "- Use stable ids S1, S2, S3.\n"
+        "- depends_on only when earlier outputs/evidence/decisions are required; otherwise [].\n"
+        "- No model labels, complexity labels, or scores.\n"
+        "Return raw JSON only: [{\"id\":\"S1\",\"desc\":\"atomic subtask\",\"depends_on\":[],"
+        "\"dependency_reason\":\"why\"}]\n"
         "JSON Output:"
     )
+
+
+def build_dependency_judge_prompt(task: str, planned_subtasks: List[PlannedSubtask]) -> str:
+    planned_json = json.dumps(planned_subtasks, ensure_ascii=False, indent=2)
+    return (
+        "Role: Dependency judge for a LangGraph task router.\n"
+        "Goal: verify and correct only execution dependencies; do not solve the task and do not score complexity.\n"
+        f"Original task:\n{task}\n"
+        f"Planner subtasks JSON:\n{planned_json}\n"
+        "Rules:\n"
+        "- Keep every existing id exactly as provided.\n"
+        "- Do not add, remove, merge, split, or rewrite subtasks.\n"
+        "- Use depends_on only when the current subtask needs prior outputs, evidence, decisions, or generated artifacts.\n"
+        "- Independent investigations, file/provider/region checks, and unrelated evidence collection should have empty depends_on.\n"
+        "- Synthesis, comparison, validation-after-implementation, reporting, and final answer steps should depend on the producing subtasks.\n"
+        "- If uncertain whether a dependency is required for correctness, include the dependency.\n"
+        "- Dependencies may reference only ids from the provided list.\n"
+        "Return raw JSON only with keys: subtasks, confidence, issues.\n"
+        "Each subtask item must contain: id, depends_on, dependency_reason.\n"
+        "JSON Output:"
+    )
+
+
+def judge_dependencies_with_model(
+    task: str,
+    planned_subtasks: List[PlannedSubtask],
+    judge_model: str,
+) -> tuple[List[PlannedSubtask], float, List[str], str]:
+    default_timeout = DEFAULT_LARGE_MODEL_TIMEOUT if is_large_model(judge_model) else 300
+    judge_timeout = int(os.environ.get("ROUTER_JUDGE_TIMEOUT", str(default_timeout)))
+    raw_text = generate_text(
+        judge_model,
+        build_dependency_judge_prompt(task, planned_subtasks),
+        timeout=judge_timeout,
+        num_predict=4096,
+        temperature=0.0,
+        usage_label="Dependency judge",
+    )
+    if router_debug_enabled():
+        print("\n[DEBUG Dependency Judge Output]")
+        print(f"  Model: {judge_model}")
+        print(f"  Raw text length: {len(raw_text)} chars")
+        print(f"  First 400 chars: {raw_text[:400]}")
+        if len(raw_text) > 400:
+            print(f"  Last 200 chars: {raw_text[-200:]}")
+        print(f"  Contains '{{': { '{' in raw_text }, Contains '}}': {'}' in raw_text }")
+        print("  ---\n")
+    judged_subtasks, confidence, issues = normalize_dependency_judgment(
+        extract_first_json_object(raw_text),
+        planned_subtasks,
+    )
+    return judged_subtasks, confidence, issues, raw_text
 
 
 def build_judge_prompt(task: str, subtask_desc: str) -> str:
@@ -3845,9 +4125,12 @@ def score_subtask_with_model(task: str, subtask_desc: str, judge_model: str) -> 
     return normalize_complexity_assessment(extract_first_json_object(raw_text), task, subtask_desc)
 
 
-def build_subtask(desc: str, assessment: ComplexityAssessment) -> Subtask:
+def build_subtask(planned: PlannedSubtask, assessment: ComplexityAssessment) -> Subtask:
     return {
-        "desc": desc,
+        "id": planned["id"],
+        "desc": planned["desc"],
+        "depends_on": list(planned["depends_on"]),
+        "dependency_reason": planned["dependency_reason"],
         "model": assessment["final_route"],
         "assessment": assessment,
     }
@@ -3862,14 +4145,16 @@ def display_plan(subtasks: List[Subtask], planner_model: str, judge_model: str) 
     for index, step in enumerate(subtasks, start=1):
         icon = "🧠 [PRO]  " if step["model"] == PRO else "⚡ [FLASH] "
         assessment = step["assessment"]
+        dependencies = ", ".join(step["depends_on"]) if step["depends_on"] else "-"
         print(
-            f"步骤 {index}: {icon}| score={assessment['complexity_score']} "
-            f"| conf={assessment['confidence']:.2f} | {step['desc']}"
+            f"步骤 {index} [{step['id']}]: {icon}| score={assessment['complexity_score']} "
+            f"| conf={assessment['confidence']:.2f} | deps={dependencies} | {step['desc']}"
         )
         print(
             f"         判定依据: {assessment['reason']} "
             f"({assessment['judge_source']}, suggested={assessment['suggested_route']})"
         )
+        print(f"         依赖依据: {step['dependency_reason']}")
     print("=" * 58)
 
 
@@ -3953,6 +4238,7 @@ def planner_parse_node(state: RouterState) -> Dict[str, Any]:
     try:
         planned_subtasks = normalize_planned_subtasks(extract_first_json_array(raw_text))
         planned_subtasks = ensure_communication_subtask(state["task"], planned_subtasks)
+        planned_subtasks = normalize_planned_subtasks(planned_subtasks)
         print(f"✅ 规划成功，拆解出 {len(planned_subtasks)} 个步骤。")
         return {
             "planned_subtasks": planned_subtasks,
@@ -3971,12 +4257,13 @@ def planner_parse_node(state: RouterState) -> Dict[str, Any]:
 def route_after_planner_parse(state: RouterState) -> str:
     if state["status"] == "planner_parse_failed":
         return "planner_fallback"
-    return "planner_ready"
+    return "dependency_judge"
 
 
 def planner_fallback_node(state: RouterState) -> Dict[str, Any]:
     planned_subtasks = build_fallback_subtasks(state["task"])
     planned_subtasks = ensure_communication_subtask(state["task"], planned_subtasks)
+    planned_subtasks = normalize_planned_subtasks(planned_subtasks)
     error_text = state["planner_error"] or "Unknown planner failure"
     print(f"⚠️ 规划器异常：{error_text}。已切换到启发式回退规划。")
     return {
@@ -3984,6 +4271,69 @@ def planner_fallback_node(state: RouterState) -> Dict[str, Any]:
         "errors": [f"Planner fallback: {error_text}"],
         "status": "planner_fallback",
     }
+
+
+def dependency_judge_node(state: RouterState) -> Dict[str, Any]:
+    print("\n[Node: Dependency Judge] 🧭 验证子任务依赖关系...")
+    try:
+        judged_subtasks, confidence, issues, raw_text = judge_dependencies_with_model(
+            state["task"],
+            state["planned_subtasks"],
+            state["judge_model"],
+        )
+        print(
+            f"  依赖判定完成: subtasks={len(judged_subtasks)} "
+            f"| confidence={confidence:.2f} | issues={len(issues)}"
+        )
+        return {
+            "planned_subtasks": judged_subtasks,
+            "dependency_raw_text": raw_text,
+            "dependency_error": "",
+            "dependency_issues": issues,
+            "dependency_confidence": confidence,
+            "history": [f"Dependency judge reviewed {len(judged_subtasks)} planned subtasks."],
+            "status": "dependencies_judged",
+        }
+    except Exception as exc:
+        error_text = compact_text(str(exc), 260)
+        print(f"  依赖判定异常: {error_text}。保留规划器依赖并进入结构校验。")
+        return {
+            "dependency_error": error_text,
+            "errors": [f"Dependency judge fallback: {error_text}"],
+            "status": "dependency_judge_failed",
+        }
+
+
+def dependency_validate_node(state: RouterState) -> Dict[str, Any]:
+    try:
+        validated_subtasks = validate_dependency_graph(state["planned_subtasks"])
+        dependency_edges = sum(len(subtask["depends_on"]) for subtask in validated_subtasks)
+        print(
+            f"\n[Node: Dependency Validate] ✅ DAG 校验通过: "
+            f"subtasks={len(validated_subtasks)}, edges={dependency_edges}"
+        )
+        return {
+            "planned_subtasks": validated_subtasks,
+            "history": [
+                f"Dependency graph validated with {len(validated_subtasks)} subtasks and {dependency_edges} edges."
+            ],
+            "status": "dependencies_validated",
+        }
+    except Exception as exc:
+        error_text = compact_text(str(exc), 260)
+        fallback_subtasks = make_serial_dependency_plan(state["planned_subtasks"])
+        print(
+            f"\n[Node: Dependency Validate] ⚠️ DAG 校验失败: {error_text}。"
+            "已切换到保守串行依赖。"
+        )
+        return {
+            "planned_subtasks": fallback_subtasks,
+            "dependency_error": error_text,
+            "dependency_issues": state["dependency_issues"] + [error_text],
+            "errors": [f"Dependency validation fallback: {error_text}"],
+            "history": ["Dependency graph invalid; switched to conservative serial execution order."],
+            "status": "dependencies_validated_with_fallback",
+        }
 
 
 def planner_ready_node(state: RouterState) -> Dict[str, Any]:
@@ -4043,7 +4393,8 @@ def route_to_judge_subtasks(state: RouterState) -> List[Send] | str:
 
 def judge_subtask_node(state: RouterState) -> Dict[str, Dict[int, JudgedSubtask]]:
     index = state["judge_index"]
-    desc = state["judge_desc"]
+    planned = state["planned_subtasks"][index - 1]
+    desc = state["judge_desc"] or planned["desc"]
     print(f"\n[Node: Judge Subtask] 🎯 Step {index} 结构化复杂度评分...")
     error = ""
     try:
@@ -4061,7 +4412,7 @@ def judge_subtask_node(state: RouterState) -> Dict[str, Dict[int, JudgedSubtask]
         "judge_results": {
             index: {
                 "index": index,
-                "subtask": build_subtask(desc, assessment),
+                "subtask": build_subtask(planned, assessment),
                 "error": error,
             }
         }
@@ -4147,6 +4498,74 @@ def route_to_parallel_executor_subtasks(state: RouterState) -> List[Send] | str:
     return sends
 
 
+def completed_subtask_ids(state: RouterState) -> set[str]:
+    return {
+        str(result.get("subtask_id") or "")
+        for result in state["execution_results"].values()
+        if str(result.get("subtask_id") or "")
+    }
+
+
+def dependency_context_results_for_subtask(
+    state: RouterState,
+    subtask: Subtask,
+) -> List[StepResult]:
+    dependency_ids = set(subtask["depends_on"])
+    if not dependency_ids:
+        return []
+    return [
+        result
+        for result in sorted(state["execution_results"].values(), key=lambda item: item["step"])
+        if result.get("subtask_id") in dependency_ids
+    ]
+
+
+def dependency_scheduler_node(state: RouterState) -> Dict[str, Any]:
+    completed_ids = completed_subtask_ids(state)
+    remaining_count = sum(1 for subtask in state["subtasks"] if subtask["id"] not in completed_ids)
+    return {
+        "current_step": len(completed_ids),
+        "history": [
+            f"Dependency scheduler sees {len(completed_ids)} completed and {remaining_count} remaining subtasks."
+        ],
+        "status": "dependency_scheduling",
+    }
+
+
+def route_to_ready_executor_subtasks(state: RouterState) -> List[Send] | str:
+    completed_ids = completed_subtask_ids(state)
+    ready: List[tuple[int, Subtask]] = []
+    remaining: List[Subtask] = []
+
+    for index, subtask in enumerate(state["subtasks"], start=1):
+        if subtask["id"] in completed_ids:
+            continue
+        remaining.append(subtask)
+        if all(dependency_id in completed_ids for dependency_id in subtask["depends_on"]):
+            ready.append((index, subtask))
+
+    if not remaining:
+        return "execution_finalize_join"
+    if not ready:
+        return "dependency_deadlock"
+
+    print(
+        "\n[Edge: Dependency Scheduler -> Executor Fanout] 🚀 Dispatching "
+        f"{len(ready)} ready subtasks; completed={len(completed_ids)}, remaining={len(remaining)}."
+    )
+    return [
+        Send(
+            "parallel_executor",
+            {
+                **state,
+                "execution_index": index,
+                "execution_subtask": subtask,
+            },
+        )
+        for index, subtask in ready
+    ]
+
+
 def route_to_deferred_executor_subtasks(state: RouterState) -> List[Send] | str:
     sends = [
         Send(
@@ -4182,11 +4601,12 @@ def invoke_parallel_executor_attempt(
     attempt_log: List[str],
 ) -> tuple[ModelInvocationResult, int]:
     model_name = state["pro_model"] if route == PRO else state["flash_model"]
+    dependency_results = dependency_context_results_for_subtask(state, subtask)
     prompt_state = dict(state)
     prompt_state.update(
         {
-            "results": list(state["execution_context_results"] or state["results"]),
-            "current_step": index - 1,
+            "results": dependency_results,
+            "current_step": len(state["execution_results"]),
             "active_subtask": subtask,
             "active_route": route,
             "active_model_name": model_name,
@@ -4236,6 +4656,8 @@ def build_parallel_step_result(
 ) -> StepResult:
     return {
         "step": index,
+        "subtask_id": subtask["id"],
+        "depends_on": list(subtask["depends_on"]),
         "planned_route": planned_route,
         "route": final_route,
         "model_name": model_name,
@@ -4440,6 +4862,66 @@ def parallel_execution_join_node(state: RouterState) -> RouterState:
         "current_step": len(context_results),
         "history": [f"Parallel executor completed {len(context_results)} independent subtasks."],
         "status": "parallel_executed",
+    }
+
+
+def dependency_execution_join_node(state: RouterState) -> RouterState:
+    ordered_results = sorted(state["execution_results"].values(), key=lambda result: result["step"])
+    completed_ids = completed_subtask_ids(state)
+    print(
+        "\n[Node: Dependency Execution Join] 🧩 "
+        f"Collected {len(ordered_results)} completed dependency-aware subtask results."
+    )
+    return {
+        "execution_context_results": ordered_results,
+        "current_step": len(completed_ids),
+        "history": [f"Dependency executor has completed {len(completed_ids)} subtasks."],
+        "status": "dependency_wave_executed",
+    }
+
+
+def dependency_deadlock_node(state: RouterState) -> RouterState:
+    completed_ids = completed_subtask_ids(state)
+    fallback_results: Dict[int, StepResult] = {}
+    errors: List[str] = []
+    for index, subtask in enumerate(state["subtasks"], start=1):
+        if subtask["id"] in completed_ids:
+            continue
+        missing = [
+            dependency_id
+            for dependency_id in subtask["depends_on"]
+            if dependency_id not in completed_ids
+        ]
+        planned_route = normalize_route(subtask.get("model"), default=PRO)
+        error = (
+            f"Dependency deadlock on step {index} ({subtask['id']}): "
+            f"missing dependencies {', '.join(missing) or 'unknown'}"
+        )
+        errors.append(error)
+        fallback_results[index] = build_parallel_step_result(
+            index=index,
+            subtask=subtask,
+            planned_route=planned_route,
+            final_route=planned_route,
+            model_name=state["pro_model"] if planned_route == PRO else state["flash_model"],
+            output=f"Dependency scheduler fallback output: {error}",
+            status="dependency_deadlock",
+            attempt_count=0,
+            retry_count=0,
+            escalated_from_flash=False,
+            used_provider_fallback=False,
+            flash_review=empty_flash_review(),
+            attempt_log=[error],
+        )
+    print(
+        "\n[Node: Dependency Deadlock] ⚠️ "
+        f"Recorded {len(fallback_results)} fallback results for blocked subtasks."
+    )
+    return {
+        "execution_results": fallback_results,
+        "errors": errors,
+        "history": ["Dependency scheduler deadlock fallback recorded blocked subtasks."],
+        "status": "dependency_deadlock",
     }
 
 
@@ -4785,6 +5267,8 @@ def record_step_node(state: RouterState) -> RouterState:
     desc = state["active_subtask"].get("desc", "N/A")
     result: StepResult = {
         "step": step_number,
+        "subtask_id": str(state["active_subtask"].get("id") or f"S{step_number}"),
+        "depends_on": list(state["active_subtask"].get("depends_on", [])),
         "planned_route": planned_route,
         "route": PRO if route == PRO else FLASH,
         "model_name": model_name,
@@ -5165,13 +5649,16 @@ def build_router_graph():
     workflow.add_node("planner_invoke", planner_invoke_node)
     workflow.add_node("planner_parse", planner_parse_node)
     workflow.add_node("planner_fallback", planner_fallback_node)
+    workflow.add_node("dependency_judge", dependency_judge_node)
+    workflow.add_node("dependency_validate", dependency_validate_node)
     workflow.add_node("planner_ready", planner_ready_node)
     workflow.add_node("judge_warmup", judge_warmup_node)
     workflow.add_node("judge_subtask", judge_subtask_node)
     workflow.add_node("assemble_plan", assemble_plan_node)
+    workflow.add_node("dependency_scheduler", dependency_scheduler_node)
     workflow.add_node("parallel_executor", parallel_executor_node)
-    workflow.add_node("parallel_execution_join", parallel_execution_join_node)
-    workflow.add_node("deferred_executor", parallel_executor_node)
+    workflow.add_node("dependency_execution_join", dependency_execution_join_node)
+    workflow.add_node("dependency_deadlock", dependency_deadlock_node)
     workflow.add_node("execution_finalize_join", execution_finalize_join_node)
     workflow.add_node("flash_finalizer", flash_finalizer_node)
     workflow.add_node("flash_finalizer_verify", flash_finalizer_verify_node)
@@ -5201,18 +5688,21 @@ def build_router_graph():
         "planner_parse",
         route_after_planner_parse,
         {
-            "planner_ready": "planner_ready",
+            "dependency_judge": "dependency_judge",
             "planner_fallback": "planner_fallback",
         },
     )
-    workflow.add_edge("planner_fallback", "planner_ready")
+    workflow.add_edge("planner_fallback", "dependency_judge")
+    workflow.add_edge("dependency_judge", "dependency_validate")
+    workflow.add_edge("dependency_validate", "planner_ready")
     workflow.add_edge("planner_ready", "judge_warmup")
     workflow.add_conditional_edges("judge_warmup", route_to_judge_subtasks)
     workflow.add_edge("judge_subtask", "assemble_plan")
-    workflow.add_conditional_edges("assemble_plan", route_to_parallel_executor_subtasks)
-    workflow.add_edge("parallel_executor", "parallel_execution_join")
-    workflow.add_conditional_edges("parallel_execution_join", route_to_deferred_executor_subtasks)
-    workflow.add_edge("deferred_executor", "execution_finalize_join")
+    workflow.add_edge("assemble_plan", "dependency_scheduler")
+    workflow.add_conditional_edges("dependency_scheduler", route_to_ready_executor_subtasks)
+    workflow.add_edge("parallel_executor", "dependency_execution_join")
+    workflow.add_edge("dependency_execution_join", "dependency_scheduler")
+    workflow.add_edge("dependency_deadlock", "execution_finalize_join")
     workflow.add_edge("execution_finalize_join", "flash_finalizer")
     workflow.add_edge("flash_finalizer", "flash_finalizer_verify")
     workflow.add_conditional_edges(
@@ -5336,6 +5826,10 @@ def create_initial_state(
         "planned_subtasks": [],
         "planner_raw_text": "",
         "planner_error": "",
+        "dependency_raw_text": "",
+        "dependency_error": "",
+        "dependency_issues": [],
+        "dependency_confidence": 0.0,
         "planner_warmup_attempt": 0,
         "judge_warmup_done": False,
         "subtasks": [],
