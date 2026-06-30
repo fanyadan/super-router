@@ -39,7 +39,9 @@ final report generation cascade.
 .
 |-- README.md
 |-- SKILL.md
+|-- super-router.png
 |-- scripts/
+|   |-- render_super_router_diagram.py
 |   `-- router.py
 `-- tests/
     |-- __init__.py
@@ -50,6 +52,8 @@ final report generation cascade.
 | --- | --- |
 | `SKILL.md` | Hermes skill contract, usage notes, architecture summary, and environment reference. |
 | `scripts/router.py` | LangGraph router implementation and CLI entry point. |
+| `scripts/render_super_router_diagram.py` | Deterministic renderer for the workflow diagram in `super-router.png`. |
+| `super-router.png` | Current LangGraph workflow diagram used by the README. |
 | `tests/test_router.py` | Regression tests for routing helpers, fallback behavior, finalization, streaming, and integration paths. |
 | `tests/__init__.py` | Keeps tests importable as a package. |
 
