@@ -1,15 +1,14 @@
-# 🔀 Super Router
+# Super Router
 
-Super Router is a LangGraph-based task router for splitting a user task into
-ordered subtasks, judging each subtask's complexity, and dispatching execution
-to either a PRO model or a FLASH model.
+Super Router is a LangGraph-based task router that decomposes a user request,
+judges each subtask, and executes ready subtasks across PRO and FLASH model
+roles. It is built for workloads where some branches need stronger reasoning
+while others are simple reporting, formatting, or low-risk IO.
 
-The router is designed for multi-model workflows where simple reporting or
-formatting work should use a fast model, while diagnosis, implementation,
-architecture, high-risk incident triage, and ambiguous decisions should use a
-stronger model. It includes planner and judge fallback paths, provider fallback
-lists, FLASH retry and escalation logic, technical metadata extraction, and a
-final report generation cascade.
+The current implementation supports planner and dependency fallback paths,
+dependency-aware executor fanout, provider fallback lists, FLASH retry and
+FLASH-to-PRO escalation, embedded technical metadata extraction, LangSmith
+tracing, and token usage accounting.
 
 ## Workflow
 
@@ -17,21 +16,26 @@ final report generation cascade.
 
 ## What It Does
 
-- Decomposes a user task into atomic, actionable subtasks. Uses **Atomic Decomposition** to split multi-entity tasks into individual executor branches for true LangGraph fanout.
-- Scores each subtask across reasoning depth, code change scope, ambiguity,
-  risk, and IO heaviness.
-- Routes each subtask to PRO or FLASH based on structured scores, confidence,
-  summary detection, and high-risk context rules.
-- Executes subtasks with configurable Codex CLI, Claude Code CLI, Gemini CLI, or Ollama-backed models.
-- Retries FLASH on transient infrastructure failures.
-- Escalates FLASH work to PRO when the output is empty, low quality, too short,
-  or explicitly says the model cannot complete the work.
-- Supports provider fallback lists for PRO, FLASH, metadata extraction, and
-  finalization.
-- Extracts high-precision "technical gold" from completed step outputs before
-  final synthesis.
-- Produces a final report through a FLASH finalizer, then a PRO finalizer, then
-  a deterministic fallback template if model finalization fails.
+- Compacts long task text into deterministic context manifests before planning,
+  judging, executing, metadata extraction, and finalization.
+- Plans atomic subtasks with stable IDs and optional `depends_on` edges.
+- Verifies and corrects the dependency DAG before execution.
+- Scores each subtask on reasoning depth, code-change scope, ambiguity, risk,
+  and IO heaviness.
+- Routes subtasks to `PRO` or `FLASH` using model scores plus deterministic
+  risk, summary, and confidence guards.
+- Schedules only dependency-ready subtasks, fans them out with LangGraph
+  `Send(...)`, joins completed waves, and repeats until the DAG is complete.
+- Executes model calls through Codex CLI, Gemini CLI, Claude Code CLI, or
+  Ollama, selected by model name.
+- Retries FLASH on transient infrastructure failures and escalates to PRO on
+  quality or capability failures.
+- Extracts compact "technical gold" metadata from successful executor outputs
+  inside each executor branch.
+- Produces the final report through a FLASH finalizer, then a PRO finalizer,
+  then a deterministic fallback report if model finalization fails.
+- Tracks provider token usage per run, prints an aggregate summary, and can
+  persist append-only JSONL records.
 
 ## Repository Layout
 
@@ -40,9 +44,11 @@ final report generation cascade.
 |-- README.md
 |-- SKILL.md
 |-- super-router.png
+|-- references/
 |-- scripts/
 |   |-- render_super_router_diagram.py
 |   `-- router.py
+|-- templates/
 `-- tests/
     |-- __init__.py
     `-- test_router.py
@@ -50,345 +56,213 @@ final report generation cascade.
 
 | Path | Purpose |
 | --- | --- |
-| `SKILL.md` | Hermes skill contract, usage notes, architecture summary, and environment reference. |
-| `scripts/router.py` | LangGraph router implementation and CLI entry point. |
-| `scripts/render_super_router_diagram.py` | Deterministic renderer for the workflow diagram in `super-router.png`. |
-| `super-router.png` | Current LangGraph workflow diagram used by the README. |
-| `tests/test_router.py` | Regression tests for routing helpers, fallback behavior, finalization, streaming, and integration paths. |
-| `tests/__init__.py` | Keeps tests importable as a package. |
+| `SKILL.md` | Hermes skill metadata and agent-facing usage contract. |
+| `scripts/router.py` | Main LangGraph router, provider dispatch, fallback logic, telemetry, token accounting, and CLI. |
+| `scripts/render_super_router_diagram.py` | Deterministic diagram renderer; verifies the diagram node set against `build_router_graph()`. |
+| `super-router.png` | Current architecture diagram used by this README. |
+| `tests/test_router.py` | Offline regression tests using `unittest` and mocks. |
+| `references/` | Supplemental operational notes. |
+| `templates/` | Shell helper templates. |
 
 ## Requirements
 
-- Python 3.10+ is recommended because the code uses modern type hint syntax.
-- `langgraph` is required at runtime.
-- `langsmith` is optional for telemetry. It is commonly installed with
-  LangGraph, but can be installed explicitly with `pip install langsmith`.
-- At least one model provider must be usable:
-  - Codex CLI for `codex/...`, bare `gpt-*`, bare `chatgpt-*`, or bare `o` plus digit model names. Codex must already be installed and logged in.
-  - Claude Code CLI for `claude/...` or bare `claude-*` model names. Claude Code must already be installed and logged in.
-  - Gemini CLI for `google-gemini-cli/...`, `gemini-*`, `pro`, `flash`, `flash-lite`, or `auto` model names.
-  - Ollama for all other model names, or use the `ollama/...` prefix when you want to be explicit.
-- Network access to Google endpoints is required for Gemini CLI unless your
-  environment routes through a configured proxy.
-- A running Ollama server is required for Ollama-backed models.
-  - **Note:** For large models (e.g., `gemma4:26b`, `gemma4:31b`), setting `num_predict` to `204800` in `router.py` or the server config is a a practical way to avoid truncated JSON output in most cases.
+- Python 3.10+.
+- `langgraph` for the runtime graph.
+- `langsmith` only when optional telemetry is enabled.
+- `Pillow` only when regenerating `super-router.png`.
+- At least one usable model provider:
+  - Codex CLI for `codex/...`, bare `gpt-*`, bare `chatgpt-*`, or bare
+    `o` plus digit model names.
+  - Gemini CLI for `google-gemini-cli/...`, `gemini-*`, `auto`, `pro`,
+    `flash`, or `flash-lite`.
+  - Claude Code CLI for `claude/...` or bare `claude-*` model names.
+  - Ollama for all other names, or explicit `ollama/...`.
+
+Install the required runtime dependency:
+
+```bash
+pip install langgraph
+```
+
+Optional dependencies:
+
+```bash
+pip install langsmith
+pip install pillow
+```
 
 ## Installation
 
-### As a Hermes Skill (Recommended)
-If you have the Hermes Agent installed, you can install this skill directly from GitHub:
+### As a Hermes Skill
+
+If you use Hermes, install or point Hermes at this skill directory, then place
+router configuration in `~/.hermes/.env`. Hermes loads that file and injects the
+variables into child `terminal()` processes.
+
+Typical skill-source install:
 
 ```bash
-# Add the repository as a skill source
 hermes skills tap add https://github.com/fanyadan/super-router
-
-# Install the skill
 hermes skills install super-router
 ```
 
-After installing, ensure the required Python dependency is present:
-```bash
-pip install langgraph
-```
+After installation, trigger it with phrasing such as `use super-router` or
+`走 super-router`.
 
-Once installed, you can trigger the router by saying "use super-router" or "走 super-router".
+### Standalone
 
-### As a standalone tool
-Install the Python dependency:
-
-```bash
-pip install langgraph
-```
-
-
-If you plan to use Ollama-backed models, start Ollama separately and pull the
-models you want to use:
-
-```bash
-ollama serve
-ollama pull gemma4:26b
-ollama pull llama3.1:8b
-ollama pull qwen2.5:7b
-```
-
-If you plan to use Gemini CLI-backed models, install and authenticate the
-`gemini` executable, or point the router to it with `ROUTER_GEMINI_CLI`.
-
-If you plan to use Claude Code-backed models, install and authenticate the
-`claude` executable, or point the router to it with `ROUTER_CLAUDE_CLI`.
-
-## Quick Start
-
-Run a task through the router:
+Run from this repository after installing `langgraph`:
 
 ```bash
 python scripts/router.py "Inspect router state flow and summarize"
 ```
 
-Enable node-level LangGraph progress output:
+For Ollama-backed models, start Ollama and pull the models you intend to use:
 
 ```bash
-python scripts/router.py --stream "Analyze K8s YAML errors and prepare an action summary"
+ollama serve
+ollama pull <model-name>
 ```
 
-Pass the task through an environment variable:
+## Quick Start
+
+Run a task:
 
 ```bash
-ROUTER_TASK="Refactor auth module to use JWT, add tests, and update docs" \
+python scripts/router.py "Analyze a multi-step task and prepare an action summary"
+```
+
+Stream node-level LangGraph progress:
+
+```bash
+python scripts/router.py --stream "Analyze a complex task, identify required actions, and draft a final note"
+```
+
+Pass the task through the environment:
+
+```bash
+ROUTER_TASK="Update a module, add tests, and refresh documentation" \
 python scripts/router.py
 ```
 
-Run the regression suite:
+Run tests:
 
 ```bash
 python -m unittest tests/test_router.py
 ```
 
-## Provider Selection
+## Current Architecture
 
-**Environment variables are now managed through `~/.hermes/.env`** (recommended when using as a Hermes skill).
-
-Hermes automatically loads `~/.hermes/.env` at startup and injects all `ROUTER_*` variables into every `terminal()` child process. No manual `env={}` passthrough is needed.
-
-```bash
-# ~/.hermes/.env (excerpt)
-# One model for all router roles. Role-specific variables below override this.
-ROUTER_MODEL=gpt-5.5
-# Equivalent explicit form:
-# ROUTER_MODEL=codex/gpt-5.5
-
-# Optional: override individual router roles.
-# ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
-# ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
-# ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
-# ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
-# ROUTER_PRO_MODEL=claude/opus
-# ROUTER_FLASH_MODEL=claude/sonnet
-
-# Optional: enable LangSmith graph/model-call telemetry
-# ROUTER_LANGSMITH_ENABLED=1
-# LANGSMITH_API_KEY=lsv2_...
-# ROUTER_LANGSMITH_PROJECT=super-router
-# ROUTER_LANGSMITH_TAGS=local,hermes
-
-# Optional: skip planner + judge warmup pings for faster iteration
-# ROUTER_SKIP_WARMUP=1
-```
-
-For standalone CLI use, export them in your shell instead:
-
-The router selects the provider from the model name:
-
-- Codex CLI is used when the model name uses the `codex/` prefix, or when a
-  bare model name starts with `gpt-`, `chatgpt-`, or `o` plus a digit, such as
-  `codex/gpt-5.5` or `gpt-5.5`.
-  The router passes `--sandbox` but intentionally does not pass
-  `--ask-for-approval`, because some `codex exec` versions do not support that
-  option.
-- Gemini CLI is used when the model name is one of `auto`, `pro`, `flash`,
-  `flash-lite`, starts with `gemini-`, or uses the `google-gemini-cli/` prefix.
-- Claude Code CLI is used when the model name uses the `claude/` prefix or
-  starts with `claude-`.
-- Ollama is used for all other model names, and `ollama/<model>` is accepted
-  as an explicit Ollama prefix.
-
-Examples:
-
-```bash
-# One Codex model for planner, judge, PRO, FLASH, metadata extraction, and finalizer.
-export ROUTER_MODEL=gpt-5.5
-
-# Gemini CLI-backed defaults for all router roles.
-export ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
-export ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
-export ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
-export ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
-
-# Claude Code-backed defaults for all router roles.
-export ROUTER_PLANNER_MODEL=claude/sonnet
-export ROUTER_JUDGE_MODEL=claude/sonnet
-export ROUTER_PRO_MODEL=claude/opus
-export ROUTER_FLASH_MODEL=claude/sonnet
-
-# Ollama-backed planner/judge/executors.
-export ROUTER_PLANNER_MODEL=gemma4:26b
-export ROUTER_JUDGE_MODEL=llama3.1:8b
-export ROUTER_PRO_MODEL=qwen3
-export ROUTER_FLASH_MODEL=qwen2.5:7b
-```
-
-For local large models, prefer a strong planner and a smaller judge:
-
-```bash
-export ROUTER_PLANNER_MODEL=gemma4:26b
-export ROUTER_JUDGE_MODEL=llama3.1:8b
-export ROUTER_MAX_CONCURRENCY=1
-```
-
-## LangSmith Telemetry
-
-LangSmith is a good fit for this router because execution is already organized
-as LangGraph nodes. Enable it only when you want external traces:
-
-```bash
-export ROUTER_LANGSMITH_ENABLED=1
-export LANGSMITH_API_KEY=<your-langsmith-key>
-export ROUTER_LANGSMITH_PROJECT=super-router
-```
-
-When enabled, the router attaches `super-router`/`langgraph` tags, model
-metadata, retry budget, and task length to the graph run. Raw provider calls are
-traced as `Super Router Model Call` child runs with prompt and output lengths by
-default. Ollama traces include token usage from
-`prompt_eval_count` and `eval_count`. Claude Code CLI traces include token usage
-from JSON `total_input_tokens` and `total_output_tokens`. Gemini CLI traces
-include token usage from JSON output when available, preferring
-`stats.models.*.tokens` and falling back to `usageMetadata`-style fields. To
-include text previews, opt in with
-`ROUTER_LANGSMITH_TRACE_PROMPTS=1` or `ROUTER_LANGSMITH_TRACE_OUTPUTS=1`.
-
-LangSmith can calculate cost when token usage is present and the provider/model
-matches LangSmith pricing or custom pricing configured in LangSmith. Ollama
-usually needs custom pricing if you want dollar-cost estimates.
-
-For sensitive workloads, prefer `ROUTER_LANGSMITH_HIDE_INPUTS=1` and
-`ROUTER_LANGSMITH_HIDE_OUTPUTS=1`, or keep telemetry disabled. Missing
-LangSmith packages or API keys are non-fatal; the router continues without
-telemetry.
-
-## Token Usage Accounting
-
-The router records token usage independently of LangSmith. Every successful
-provider call is added to an in-process run ledger and printed after the final
-report.
-
-- Ollama usage comes from `prompt_eval_count` and `eval_count`.
-- Claude Code CLI usage comes from JSON `total_input_tokens` and
-  `total_output_tokens`.
-- Gemini CLI usage comes from JSON `stats.models.*.tokens` fields such as
-  `prompt`, `candidates`, `thoughts`, `cached`, `tool`, and `total`.
-- If a provider response does not include token data, the call is still recorded
-  as `usage_source=unavailable` and excluded from token totals.
-
-The final router state includes `token_usage` for per-call records and
-`token_usage_summary` for aggregated totals by model and provider.
-
-Set `ROUTER_TOKEN_USAGE_LEDGER=~/.hermes/super-router-usage.jsonl` to persist
-the same per-call records as append-only JSONL. Each line includes run metadata,
-the aggregate summary, and one provider-call record.
-
-## Architecture
-
-The main graph is implemented in `scripts/router.py` with LangGraph
-`StateGraph`.
+The main graph is built by `build_router_graph()` in `scripts/router.py`.
 
 ```text
 START
   -> planner_warmup
+       loops until 3 attempts, or is skipped with ROUTER_SKIP_WARMUP
   -> planner_invoke
   -> planner_parse
+       parse failure -> planner_fallback
+  -> dependency_judge
+  -> dependency_validate
+       invalid DAG -> conservative serial dependency fallback
   -> planner_ready
   -> judge_warmup
   -> judge_subtask fanout
   -> assemble_plan
-  -> parallel_executor fanout
-  -> parallel_execution_join
-  -> deferred_executor fanout for synthesis/reporting subtasks
+  -> dependency_scheduler
+       ready subtasks -> parallel_executor fanout
+       no ready subtasks with remaining work -> dependency_deadlock
+       no remaining work -> execution_finalize_join
+  -> dependency_execution_join
+       returns to dependency_scheduler for the next ready wave
   -> execution_finalize_join
   -> flash_finalizer
   -> flash_finalizer_verify
-  -> pro_finalizer or deterministic_finalizer when needed
+       accepted -> finalizer_complete
+       rejected or failed -> pro_finalizer or deterministic_finalizer
+  -> pro_finalizer
+  -> pro_finalizer_verify
+       accepted -> finalizer_complete
+       rejected or failed -> deterministic_finalizer
+  -> deterministic_finalizer
   -> finalizer_complete
   -> END
 ```
 
-The router also has a small nested provider fallback graph used by
-`invoke_with_provider_fallback()`:
+The router also uses a nested provider fallback graph for every model call that
+needs fallback support:
 
 ```text
-model_attempt_prepare -> model_invoke -> retry next provider or finish
+model_attempt_prepare -> model_invoke -> model_attempt_prepare or END
 ```
+
+Fallback candidates are deduplicated. Infrastructure or unknown failures can
+advance to the next provider candidate; capability or quality failures stop the
+provider fallback loop.
 
 ## Runtime Flow
 
-1. Planner warmup pings the planner model three times.
-2. Planner invoke asks the planner to emit a raw JSON array of subtask objects.
-3. Planner parse extracts and normalizes subtasks.
-4. Planner fallback creates heuristic subtasks if planning fails or returns
-   invalid JSON.
-5. Communication subtasks are split out when a task mixes investigation and
-   reporting.
-6. Judge warmup pings the judge model before fanout.
-7. Judge fanout scores every planned subtask independently.
-8. Judge fallback applies heuristic scoring when the model call or JSON parse
-   fails.
-9. Executor fanout dispatches independent subtasks concurrently through
-   LangGraph `Send(...)`, bounded by `ROUTER_MAX_CONCURRENCY`.
-10. Each executor branch invokes the selected route, including any provider
-   fallbacks.
-11. FLASH review verifies FLASH output inside the branch and either records,
-   retries, or escalates
-   to PRO.
-12. Each branch records its own outcome and extracts atomic technical facts from
-   successful output.
-13. Synthesis/reporting subtasks run after the independent branches so they can
-   see completed context.
-14. The final join orders results by original step number.
-15. Finalizer creates the final report with FLASH, PRO, or a deterministic
-   fallback template.
+1. Build initial state, resolve model roles, fallback lists, retry budget,
+   recursion limit, and optional max concurrency.
+2. Warm the planner model with three `OK` calls unless warmup is skipped.
+3. Ask the planner for raw JSON subtasks with stable IDs and dependency hints.
+4. Parse and normalize planner output; if that fails, build heuristic fallback
+   subtasks.
+5. Ask the dependency judge to correct only `depends_on` edges and dependency
+   reasons.
+6. Validate the DAG; if invalid, convert it to a conservative serial plan.
+7. Warm the judge model unless warmup is skipped.
+8. Fan out one judge branch per planned subtask.
+9. Assemble the ordered plan and display route, score, confidence, and
+   dependency rationale.
+10. Repeatedly schedule every subtask whose dependencies have completed.
+11. Execute each ready branch through PRO or FLASH, including provider
+   fallback, FLASH review, retry, escalation, and branch-local metadata
+   extraction.
+12. Join executor wave results and return to the scheduler until all subtask
+   IDs are complete.
+13. If dependency scheduling deadlocks, record fallback results for blocked
+   subtasks and continue to finalization.
+14. Finalize with FLASH, escalate to PRO when useful, or emit a deterministic
+   fallback report.
+15. Print the final report, token usage summary, and optional ledger path.
 
-## Task Splitting
+## Planning And Dependencies
 
-Task splitting happens in the planner phase. The planner receives the original
-task and is prompted to return only a raw JSON array:
+The planner receives a compact task context manifest rather than unbounded raw
+task text. Long prompts are converted into JSON fields such as objective,
+entities, constraints, deliverables, evidence requirements, decomposition
+hints, and a compact source brief.
 
-```json
-[
-  {"desc": "Inspect the failing API path and isolate the root cause"},
-  {"desc": "Prepare a concise team status update with the findings"}
-]
-```
-
-The planner is asked to produce 2-6 ordered subtasks that are atomic,
-actionable, and outcome-oriented. It must not assign model names, route labels,
-or complexity scores. Routing is handled later by the judge.
-
-After the model response is received, the router:
-
-1. Extracts the first valid JSON array from the response.
-2. Normalizes each item into `{"desc": "..."}` form.
-3. Drops empty subtasks.
-4. Splits mixed investigation/reporting steps when possible.
-5. Adds a separate communication subtask when the original task asks for a
-   summary, status update, impact note, report, or message for another person.
-
-For example, a planned step like this:
-
-```text
-Debug intermittent API failure and send a concise team update
-```
-
-can become:
+Planner output is expected to be raw JSON:
 
 ```json
 [
-  {"desc": "Debug intermittent API failure"},
-  {"desc": "send a concise team update"}
+  {
+    "id": "S1",
+    "desc": "Inspect the first required technical area",
+    "depends_on": [],
+    "dependency_reason": "Independent evidence collection."
+  },
+  {
+    "id": "S2",
+    "desc": "Prepare the requested final summary",
+    "depends_on": ["S1"],
+    "dependency_reason": "Summary depends on the inspection findings."
+  }
 ]
 ```
 
-If the planner fails, times out, or returns invalid JSON, the router uses a
-heuristic fallback. The fallback creates core analysis/implementation subtasks
-for tasks containing words such as `analyze`, `debug`, `fix`, `refactor`,
-`rewrite`, `implement`, `design`, or their Chinese equivalents. It also adds a
-final summary/reporting subtask when the original task asks for documentation,
-status output, saving, or reporting.
+The dependency judge may remove unnecessary dependencies or add required ones,
+but it must keep the existing subtasks and IDs. If dependency judgment fails,
+the router keeps the planner dependencies and still validates them. If
+validation detects duplicate IDs, unknown dependencies, self-dependencies, or
+cycles, execution falls back to a serial dependency chain.
 
-## Complexity Identification
+## Complexity Scoring
 
-Complexity identification happens after task splitting. Each normalized subtask
-is sent independently to the judge model along with the original task for risk
-context. The judge returns raw JSON with:
+Each subtask is judged independently with the original task available as risk
+context. The judge returns:
 
 ```json
 {
@@ -405,44 +279,15 @@ context. The judge returns raw JSON with:
 }
 ```
 
-The router then normalizes and clamps score values to their allowed ranges:
+Score ranges:
 
 | Field | Range | Meaning |
 | --- | --- | --- |
-| `reasoning_depth` | 0-3 | Lookup/formatting through architecture or open-ended investigation. |
-| `code_change_scope` | 0-3 | No code through broad refactor or migration. |
-| `ambiguity` | 0-2 | Clear through unclear/open-ended. |
-| `risk` | 0-2 | Low-risk through high-risk or hard-to-reverse. |
-| `io_heaviness` | 0-2 | Little IO through mostly reporting/formatting. |
-
-Then it applies contextual biases before making the final route decision:
-
-- Summary/status/reporting subtasks are biased toward FLASH when they do not
-  contain deep-work terms.
-- Diagnostic, debugging, implementation, refactor, migration, design, and logic
-  subtasks are biased toward PRO.
-- Production, billing, payment, finance, auth, security, rollback, containment,
-  and incident-related subtasks are treated as high risk.
-- Evidence gathering in high-risk incidents stays on PRO when it supports
-  diagnosis or decision-making, even if it mostly reads logs or data.
-- Low-confidence boundary cases default to PRO.
-
-If judge model scoring fails, the router builds a heuristic assessment from
-keywords in the subtask text and original task. That fallback uses the same
-score fields and the same final route decision function, so planner or judge
-failures still produce an auditable routing plan.
-
-## Routing Model
-
-Each subtask is scored on five dimensions:
-
-| Field | Range | Meaning |
-| --- | --- | --- |
-| `reasoning_depth` | 0-3 | Lookup/formatting through architecture or open-ended investigation. |
-| `code_change_scope` | 0-3 | No code through broad refactor or migration. |
-| `ambiguity` | 0-2 | Clear through unclear/open-ended. |
-| `risk` | 0-2 | Low-risk through high-risk or hard-to-reverse. |
-| `io_heaviness` | 0-2 | Little IO through mostly reporting/formatting. |
+| `reasoning_depth` | `0-3` | Lookup or formatting through architecture/open-ended investigation. |
+| `code_change_scope` | `0-3` | No code change through broad refactor or migration. |
+| `ambiguity` | `0-2` | Clear through unclear or open-ended. |
+| `risk` | `0-2` | Low risk through high-risk or hard-to-reverse. |
+| `io_heaviness` | `0-2` | Little IO through mostly IO, reporting, or formatting. |
 
 The aggregate `complexity_score` is:
 
@@ -450,141 +295,249 @@ The aggregate `complexity_score` is:
 reasoning_depth + code_change_scope + ambiguity + risk
 ```
 
-General routing rules:
+Routing guards then adjust or override the model suggestion:
 
 | Condition | Route |
 | --- | --- |
 | Summary, report, recap, or status update with no deep-work language | FLASH |
-| High-risk production, billing, payment, finance, auth, security, rollback, or containment work | PRO |
 | Diagnostic investigation, debugging, fixing, implementation, migration, refactor, or design work | PRO |
+| High-risk operational, financial, security, rollback, containment, or incident work | PRO |
+| High-risk evidence gathering that supports diagnosis or decision-making | PRO |
 | Judge confidence below `0.35` | PRO |
 | `complexity_score >= 5` | PRO |
-| Any of reasoning depth, code change scope, or risk is at least `2` | PRO |
-| `complexity_score <= 2` and IO-heavy | FLASH |
-| Low-complexity IO-heavy task with high confidence | FLASH |
-| Unclear boundary case | PRO |
+| Any of reasoning depth, code-change scope, or risk is at least `2` | PRO |
+| `complexity_score <= 2` and IO-heavy with high confidence | FLASH |
+| Boundary or unclear case | PRO |
 
-High-risk evidence gathering is intentionally kept on PRO because log review,
-configuration comparison, data reconciliation, or transaction inspection can be
-part of root-cause analysis rather than simple IO.
+If structured judge output fails, the router builds a heuristic assessment using
+the same score fields, route decision function, and audit fields.
 
-## FLASH Review and Escalation
+## Dependency-Aware Execution
 
-FLASH output goes through a review node before it is recorded.
+Execution is wave-based:
 
-Infrastructure failures are retried within the configured retry budget:
+- `dependency_scheduler` computes completed subtask IDs and remaining work.
+- Ready subtasks are those whose `depends_on` IDs are all complete.
+- Ready subtasks are dispatched concurrently to `parallel_executor`, bounded by
+  LangGraph `max_concurrency`.
+- `dependency_execution_join` orders completed wave results, records progress,
+  and returns control to the scheduler.
+- `execution_finalize_join` creates the final ordered `results` list once all
+  subtasks are complete.
+
+Executor prompts include only direct dependency results for the active subtask.
+This keeps comparison, synthesis, and reporting steps from running before the
+evidence-producing branches they depend on.
+
+If no subtask is ready while work remains, `dependency_deadlock` records
+fallback results for blocked subtasks, adds errors, and allows the finalizer to
+report the dependency issue instead of crashing the graph.
+
+## FLASH Review And Escalation
+
+FLASH execution is accepted only when the output passes heuristic review.
+
+Infrastructure-style failures are retried until `ROUTER_FLASH_RETRY_BUDGET` is
+exhausted:
 
 - timeout
 - network failure
 - rate limit
-- connection reset/refused
+- connection reset or refused
 - service unavailable
 - transport or deadline errors
 
 Capability or quality failures escalate to PRO:
 
 - empty output
-- output shorter than 48 characters for a non-summary task
-- output simply repeats the subtask description
-- output says it cannot complete or needs more context
-- provider failure that looks like insufficient capability rather than
+- too-short output for a non-summary subtask
+- output that simply repeats the subtask description
+- output saying it cannot complete or needs more context
+- provider failure classified as capability or quality rather than
   infrastructure
 
-If FLASH retry budget is exhausted, the router records a deterministic failure
-message for that step and continues to finalization instead of crashing the
-whole graph.
+If FLASH retry budget is exhausted, the branch records a deterministic failure
+message and the graph continues.
 
-## Provider Fallback
+## Provider Selection
 
-PRO and FLASH can each have fallback model lists. Fallbacks are tried only when
-the failure looks infrastructure-related or unknown. The fallback loop stops on
-capability or quality failures because trying a different provider is unlikely
-to fix a task that needs stronger reasoning.
+Model names choose the transport:
+
+| Transport | Model-name match |
+| --- | --- |
+| Codex CLI | `codex/...`, bare `gpt-*`, bare `chatgpt-*`, or bare `o` plus digit names such as `o3` or `o4-mini`. Explicit `ollama/`, `claude/`, and `google-gemini-cli/` prefixes take precedence. |
+| Gemini CLI | `google-gemini-cli/...`, bare `gemini-*`, `auto`, `pro`, `flash`, or `flash-lite`. |
+| Claude Code CLI | `claude/...` or bare `claude-*`. |
+| Ollama HTTP | All other model names, including explicit `ollama/...`. |
+
+Default role models:
+
+| Role | Default |
+| --- | --- |
+| Planner | `google-gemini-cli/gemini-3-pro-preview` |
+| Judge | `google-gemini-cli/gemini-3-flash-preview` |
+| PRO executor/finalizer | `google-gemini-cli/gemini-3-pro-preview` |
+| FLASH executor/finalizer | `google-gemini-cli/gemini-3-flash-preview` |
+
+Use one model for every role:
+
+```bash
+export ROUTER_MODEL=gpt-5.5
+```
+
+Override individual roles:
+
+```bash
+export ROUTER_PLANNER_MODEL=google-gemini-cli/gemini-3-pro-preview
+export ROUTER_JUDGE_MODEL=google-gemini-cli/gemini-3-flash-preview
+export ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
+export ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
+```
+
+Provider fallback placeholders:
 
 ```bash
 export ROUTER_PRO_MODEL=google-gemini-cli/gemini-3-pro-preview
-export ROUTER_PRO_FALLBACK_MODELS=qwen3,gemma4:26b
+export ROUTER_PRO_FALLBACK_MODELS=<pro-fallback-1>,<pro-fallback-2>
 
 export ROUTER_FLASH_MODEL=google-gemini-cli/gemini-3-flash-preview
-export ROUTER_FLASH_FALLBACK_MODELS=qwen2.5:7b,llama3.1:8b
+export ROUTER_FLASH_FALLBACK_MODELS=<flash-fallback-1>,<flash-fallback-2>
 ```
 
-Duplicate model names are removed before invocation.
+Codex-specific settings:
 
-## Finalization
-
-Final report generation follows this cascade:
-
-```text
-FLASH finalizer -> PRO finalizer -> deterministic finalizer
+```bash
+export ROUTER_MODEL=codex/gpt-5.5
+export ROUTER_CODEX_CWD=/path/to/worktree
+export ROUTER_CODEX_SANDBOX=read-only
 ```
 
-The finalizer prompt includes:
+The router invokes Codex with `codex exec`, `--ephemeral`,
+`--skip-git-repo-check`, `--color never`, and `--output-last-message`. It
+intentionally does not pass `--ask-for-approval`, because some `codex exec`
+versions do not support that option.
 
-- original task
-- planner model
-- judge model
-- technical metadata blocks from successful steps
-- execution log JSON
+For local large models, prefer a strong planner and a smaller judge, and
+serialize fanout:
 
-The model-generated final report must be non-empty, avoid "cannot complete"
-style low-quality markers, and be at least 80 characters. Otherwise the router
-continues to the next finalizer path.
-
-The deterministic finalizer serves as a critical safety net, ensuring a result is
-returned even when massive synthesis prompts cause API timeouts or model failures.
-
-If FLASH and PRO resolve to the same effective model path and FLASH fails for a
-non-capability reason, the router skips redundant PRO escalation and goes
-straight to the deterministic finalizer.
+```bash
+export ROUTER_PLANNER_MODEL=<strong-local-model>
+export ROUTER_JUDGE_MODEL=<smaller-local-model>
+export ROUTER_MAX_CONCURRENCY=1
+```
 
 ## Environment Variables
 
-When running as a Hermes skill, set these in `~/.hermes/.env` (one `KEY=VALUE` per line).
-When running standalone, export them in your shell.
+When running as a Hermes skill, set these in `~/.hermes/.env`. When running
+standalone, export them in your shell.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `ROUTER_TASK` | unset | Task text used when no positional CLI task is provided. |
-| `ROUTER_MODEL` | unset | Global model default for planner, judge, PRO, and FLASH roles. Role-specific `ROUTER_*_MODEL` values override it. |
-| `ROUTER_PLANNER_MODEL` | `google-gemini-cli/gemini-3-pro-preview` | Model used to decompose the original task into subtasks. |
-| `ROUTER_PLANNER_TASK_CHAR_LIMIT` | `6000` | Character budget for the planner-only context manifest JSON. Long task text is deterministically converted into objective, entity, constraint, deliverable, evidence, and source-brief fields before planner invocation. |
-| `ROUTER_PLANNER_MAX_OUTPUT_TOKENS` | `4096` | Maximum generated tokens requested from the planner for the JSON subtask list. |
-| `ROUTER_JUDGE_CONTEXT_CHAR_LIMIT` | `3000` | Character budget for the judge context JSON. Defaults are automatically expanded for high-risk tasks unless explicitly set. |
-| `ROUTER_EXECUTOR_CONTEXT_CHAR_LIMIT` | `8000` | Character budget for executor context JSON, including scoped task context, routing rationale, escalation details, and compact prior results. |
-| `ROUTER_METADATA_OUTPUT_CHAR_LIMIT` | `6000` | Character budget for metadata extraction context JSON and bounded executor output excerpts. |
-| `ROUTER_FINALIZER_CONTEXT_CHAR_LIMIT` | `12000` | Character budget for finalizer context JSON, including compact task context, technical metadata, and compact execution results. |
-| `ROUTER_JUDGE_MODEL` | `google-gemini-cli/gemini-3-flash-preview` | Model used for structured complexity scoring. |
-| `ROUTER_PRO_MODEL` | `google-gemini-cli/gemini-3-pro-preview` | Primary heavy reasoning executor and PRO finalizer model. |
-| `ROUTER_FLASH_MODEL` | `google-gemini-cli/gemini-3-flash-preview` | Primary fast executor and FLASH finalizer model. |
-| `ROUTER_PRO_FALLBACK_MODELS` | unset | Comma-separated provider fallback list for PRO. |
-| `ROUTER_FLASH_FALLBACK_MODELS` | unset | Comma-separated provider fallback list for FLASH. |
-| `ROUTER_CODEX_CLI` | first `codex` on `PATH`, else `codex` | Codex CLI executable path for Codex-backed model names. |
-| `ROUTER_CODEX_CWD` | unset | Optional working directory passed to `codex exec --cd`. |
-| `ROUTER_CODEX_SANDBOX` | `read-only` | Sandbox mode passed to `codex exec --sandbox`. |
-| `ROUTER_CLAUDE_CLI` | first `claude` on `PATH`, else `claude` | Claude Code CLI executable path for Claude-backed model names. |
+| `ROUTER_MODEL` | unset | Global model default for planner, judge, PRO, and FLASH roles. Role-specific variables override it. |
+| `ROUTER_PLANNER_MODEL` | `google-gemini-cli/gemini-3-pro-preview` | Model used for task decomposition. |
+| `ROUTER_JUDGE_MODEL` | `google-gemini-cli/gemini-3-flash-preview` | Model used for dependency judgment and complexity scoring. |
+| `ROUTER_PRO_MODEL` | `google-gemini-cli/gemini-3-pro-preview` | Primary PRO executor and PRO finalizer model. |
+| `ROUTER_FLASH_MODEL` | `google-gemini-cli/gemini-3-flash-preview` | Primary FLASH executor and FLASH finalizer model. |
+| `ROUTER_PRO_FALLBACK_MODELS` | unset | Comma-separated PRO provider fallback list. |
+| `ROUTER_FLASH_FALLBACK_MODELS` | unset | Comma-separated FLASH provider fallback list. |
 | `ROUTER_FLASH_RETRY_BUDGET` | `1` | Number of FLASH retries for transient or unknown failures before recording failure. |
-| `ROUTER_RECURSION_LIMIT` | `128` | LangGraph recursion limit for the main router graph. |
-| `ROUTER_MAX_CONCURRENCY` | `auto` | Max concurrent LangGraph branches for judge and executor fanout. Essential for multi-entity atomic tasks; set to `1` for local 26B+ Judge models or constrained hardware. |
-| `ROUTER_JUDGE_TIMEOUT` | `6000` for large judge models, otherwise `300` | Timeout in seconds for judge model calls. Use high values (6000) as a workaround to prevent timeouts during complex reasoning. |
+| `ROUTER_SKIP_WARMUP` | false | Skip planner and judge warmup pings when set to `1`, `true`, or `yes`. |
+| `ROUTER_RECURSION_LIMIT` | `128` | LangGraph recursion limit for the main graph. |
+| `ROUTER_MAX_CONCURRENCY` | auto | Max concurrent LangGraph branches. Auto resolves to `1` for large judge models and otherwise leaves LangGraph default behavior. |
+| `ROUTER_PLANNER_TASK_CHAR_LIMIT` | `6000` | Character budget for the compact planner context manifest. |
+| `ROUTER_PLANNER_MAX_OUTPUT_TOKENS` | `4096` | Planner JSON output token cap. |
+| `ROUTER_JUDGE_CONTEXT_CHAR_LIMIT` | `3000` | Character budget for judge context JSON. |
+| `ROUTER_EXECUTOR_CONTEXT_CHAR_LIMIT` | `8000` | Character budget for executor context JSON. |
+| `ROUTER_METADATA_OUTPUT_CHAR_LIMIT` | `6000` | Character budget for metadata extraction context and output excerpts. |
+| `ROUTER_FINALIZER_CONTEXT_CHAR_LIMIT` | `12000` | Character budget for finalizer context JSON. |
+| `ROUTER_JUDGE_TIMEOUT` | `6000` for large judge models, otherwise `300` | Timeout in seconds for dependency judge and complexity judge calls. |
 | `ROUTER_FINALIZER_TIMEOUT` | `6000` | Timeout in seconds for FLASH and PRO finalizer calls. |
 | `ROUTER_OLLAMA_URL` | `http://localhost:11434/api/generate` | Ollama generate endpoint. |
+| `ROUTER_CODEX_CLI` | first `codex` on `PATH`, else `codex` | Codex CLI executable path. |
+| `ROUTER_CODEX_CWD` | unset | Optional working directory passed to `codex exec --cd`. |
+| `ROUTER_CODEX_SANDBOX` | `read-only` | Sandbox mode passed to `codex exec --sandbox`. |
 | `ROUTER_GEMINI_CLI` | first `gemini` on `PATH`, else `/opt/homebrew/bin/gemini` | Gemini CLI executable path. |
-| `ROUTER_DEBUG` | false | Enables raw planner, judge, and Ollama diagnostic output when set to `1`, `true`, `yes`, `on`, or `debug`. |
-| `ROUTER_LANGSMITH_ENABLED` | false | Enables optional LangSmith tracing when `langsmith` and `LANGSMITH_API_KEY` are available. |
-| `ROUTER_LANGSMITH_PROJECT` | `super-router` | LangSmith project name; falls back to `LANGSMITH_PROJECT` when set. |
-| `ROUTER_LANGSMITH_TAGS` | unset | Comma-separated extra LangSmith tags appended to `super-router,langgraph`. |
-| `ROUTER_LANGSMITH_TRACE_PROMPTS` | false | Adds prompt previews to custom model-call traces. |
-| `ROUTER_LANGSMITH_TRACE_OUTPUTS` | false | Adds output previews to custom model-call traces. |
-| `ROUTER_LANGSMITH_HIDE_INPUTS` | false | Requests LangSmith SDK input hiding for graph traces. |
-| `ROUTER_LANGSMITH_HIDE_OUTPUTS` | false | Requests LangSmith SDK output hiding for graph traces. Token counts are still retained when available. |
-| `ROUTER_LANGSMITH_FLUSH` | true | Flushes LangSmith traces before the CLI process exits. |
-| `ROUTER_TOKEN_USAGE_LEDGER` | unset | Optional JSONL path for appending per-call token usage records, e.g. `~/.hermes/super-router-usage.jsonl`. |
+| `GEMINI_CLI_SYSTEM_SETTINGS_PATH` | platform default | Optional base Gemini CLI settings file. The router writes a temporary settings override per call to force temperature. |
+| `ROUTER_CLAUDE_CLI` | first `claude` on `PATH`, else `claude` | Claude Code CLI executable path. |
+| `ROUTER_DEBUG` | false | Print raw planner, judge, and provider diagnostic snippets when set to `1`, `true`, `yes`, `on`, or `debug`. |
+| `ROUTER_TOKEN_USAGE_LEDGER` | unset | Optional append-only JSONL path for per-call token usage records. |
 
-The PRO executor timeout, FLASH executor timeout, and default finalizer timeouts
-are conservative in the current code (`6000` seconds) to support long-running
-large-model workflows. External terminal or process timeouts can still stop the
-router before those internal timeouts are reached.
+The code-level PRO executor, FLASH executor, and finalizer defaults are
+conservative (`6000` seconds) for long-running model workflows. External shell,
+terminal, or process supervisors can still stop the process earlier.
+
+Unset judge, executor, metadata, and finalizer context limits are doubled for
+high-risk tasks. Explicit environment values are used as-is.
+
+## LangSmith Telemetry
+
+LangSmith tracing is optional and non-fatal. It is active only when the
+`langsmith` package is importable, tracing is requested, and an API key is
+configured.
+
+Enable tracing:
+
+```bash
+export ROUTER_LANGSMITH_ENABLED=1
+export LANGSMITH_API_KEY=<your-langsmith-key>
+export ROUTER_LANGSMITH_PROJECT=super-router
+export ROUTER_LANGSMITH_TAGS=local,hermes
+```
+
+Tracing can also be requested through `LANGSMITH_TRACING` or
+`LANGCHAIN_TRACING_V2` when `ROUTER_LANGSMITH_ENABLED` is unset. Set
+`ROUTER_LANGSMITH_ENABLED=false` to force tracing off.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ROUTER_LANGSMITH_ENABLED` | unset/false | Router-specific tracing toggle. |
+| `LANGSMITH_API_KEY` / `LANGCHAIN_API_KEY` | unset | API key used by the LangSmith client. |
+| `ROUTER_LANGSMITH_PROJECT` | `super-router` | Project name; falls back to `LANGSMITH_PROJECT`. |
+| `ROUTER_LANGSMITH_TAGS` | unset | Comma-separated tags appended to `super-router,langgraph`. |
+| `LANGSMITH_ENDPOINT` / `LANGCHAIN_ENDPOINT` | LangSmith default | Optional API endpoint. |
+| `LANGSMITH_WORKSPACE_ID` | unset | Optional workspace ID. |
+| `ROUTER_LANGSMITH_TRACE_PROMPTS` | false | Include compact prompt previews in custom model-call traces. |
+| `ROUTER_LANGSMITH_TRACE_OUTPUTS` | false | Include compact output previews in custom model-call traces. |
+| `ROUTER_LANGSMITH_HIDE_INPUTS` | false | Request SDK input hiding for graph traces. |
+| `ROUTER_LANGSMITH_HIDE_OUTPUTS` | false | Request SDK output hiding for graph traces. Token counts are retained when available. |
+| `ROUTER_LANGSMITH_FLUSH` | true | Flush traces before process exit. |
+
+The graph run includes `super-router` and `langgraph` tags, role model names,
+fallback counts, retry budget, run ID, and task length. Raw provider calls are
+traced as `Super Router Model Call` child runs with provider, transport,
+timeout, token usage when available, and prompt/output lengths by default.
+Prompt and output text previews are opt-in.
+
+## Token Usage Accounting
+
+Token usage is tracked even when LangSmith is disabled. Each successful
+provider call records:
+
+- run ID and call index
+- label, provider, model, and usage source
+- input, output, total, cached, candidate, thought, and tool tokens when
+  available
+- prompt and output character counts
+
+Provider sources:
+
+| Provider | Usage source |
+| --- | --- |
+| Ollama | `prompt_eval_count` and `eval_count` from `/api/generate`. |
+| Gemini CLI | `stats.models.*.tokens` when available, with `usageMetadata` fields as fallback. |
+| Claude Code CLI | `usage`, `model_usage`, or legacy total input/output token fields from JSON output. |
+| Codex CLI | Recorded as `usage_source=unavailable` unless the CLI output supplies token data in the future. |
+
+The final state contains `token_usage` and `token_usage_summary`, and the CLI
+prints the same aggregate after the final report. Persist JSONL records with:
+
+```bash
+export ROUTER_TOKEN_USAGE_LEDGER=~/.hermes/super-router-usage.jsonl
+```
+
+Each JSONL line contains run metadata, the aggregate summary, and one
+provider-call record.
 
 ## CLI
 
@@ -592,17 +545,15 @@ router before those internal timeouts are reached.
 usage: router.py [-h] [--stream] [task ...]
 ```
 
-Arguments:
-
 | Argument | Meaning |
 | --- | --- |
-| `task` | Task description. All positional words are joined with spaces. If omitted, `ROUTER_TASK` is used. |
+| `task` | Task description. Positional words are joined with spaces. If omitted, `ROUTER_TASK` is used. |
 | `--stream` | Emit node-level LangGraph progress updates while the graph runs. |
 | `-h`, `--help` | Show CLI help. |
 
 ## Python API
 
-The router can also be imported from Python:
+The main programmatic entry point is `run_router_app()`:
 
 ```python
 from scripts.router import run_router_app
@@ -625,32 +576,42 @@ Useful lower-level helpers:
 
 | Helper | Purpose |
 | --- | --- |
-| `create_initial_state()` | Resolve models, retry budgets, fallback lists, and initial graph state. |
+| `create_initial_state()` | Resolve models, fallback lists, retry budget, and initial graph state. |
 | `prepare_router_run()` | Build the graph and resolve graph config without invoking it. |
-| `run_router_app()` | Main programmatic entry point. |
-| `generate_text()` | Provider-dispatching text generation helper. |
-| `invoke_with_provider_fallback()` | Provider fallback graph wrapper. |
-| `build_fallback_assessment()` | Heuristic judge fallback. |
-| `verify_flash_output()` | FLASH quality guard. |
-| `build_fallback_report()` | Deterministic final report builder. |
+| `build_router_graph()` | Compile the main LangGraph `StateGraph`. |
+| `generate_text()` | Dispatch one prompt to the provider inferred from the model name. |
+| `invoke_with_provider_fallback()` | Execute a provider candidate sequence through the nested fallback graph. |
+| `build_fallback_assessment()` | Build heuristic judge output when structured scoring fails. |
+| `verify_flash_output()` | Apply FLASH quality review. |
+| `build_fallback_report()` | Build the deterministic final report. |
 
 ## Output State
 
-`run_router_app()` returns a JSON-serializable router state. Important fields:
+`run_router_app()` returns a JSON-serializable `RouterState`. Important fields:
 
 ```json
 {
+  "run_id": "uuid",
   "task": "original task string",
   "planner_model": "model used for planning",
-  "judge_model": "model used for scoring",
+  "judge_model": "model used for dependency and route judgment",
   "pro_model": "primary PRO model",
   "flash_model": "primary FLASH model",
   "pro_fallback_models": ["optional", "fallbacks"],
   "flash_fallback_models": ["optional", "fallbacks"],
-  "planned_subtasks": [{"desc": "subtask text"}],
+  "planned_subtasks": [
+    {
+      "id": "S1",
+      "desc": "subtask text",
+      "depends_on": [],
+      "dependency_reason": "why this dependency shape is valid"
+    }
+  ],
   "subtasks": [
     {
+      "id": "S1",
       "desc": "subtask text",
+      "depends_on": [],
       "model": "PRO",
       "assessment": {
         "scores": {
@@ -672,13 +633,15 @@ Useful lower-level helpers:
   "results": [
     {
       "step": 1,
+      "subtask_id": "S1",
+      "depends_on": [],
       "planned_route": "FLASH",
       "route": "PRO",
       "model_name": "google-gemini-cli/gemini-3-pro-preview",
       "desc": "subtask text",
       "output": "model output",
       "status": "executed",
-      "attempt_count": 1,
+      "attempt_count": 2,
       "retry_count": 0,
       "escalated_from_flash": true,
       "used_provider_fallback": false,
@@ -690,7 +653,7 @@ Useful lower-level helpers:
       "attempt_log": ["audit log entries"]
     }
   ],
-  "history": ["graph audit history"],
+  "history": ["graph audit history and technical metadata blocks"],
   "errors": ["fallback or failure messages"],
   "final_report": "final report text",
   "finalizer_outcome": {
@@ -701,24 +664,14 @@ Useful lower-level helpers:
     "reason": "Finalizer output passed heuristic verification.",
     "attempt_log": ["audit log entries"]
   },
-  "token_usage": [
-    {
-      "label": "Planner invoke",
-      "provider": "google_genai",
-      "model_name": "gemini-3-pro-preview",
-      "usage_source": "gemini_cli_stats",
-      "input_tokens": 1000,
-      "output_tokens": 250,
-      "total_tokens": 1250
-    }
-  ],
+  "token_usage": [],
   "token_usage_summary": {
-    "calls": 1,
-    "calls_with_usage": 1,
+    "calls": 0,
+    "calls_with_usage": 0,
     "calls_without_usage": 0,
-    "input_tokens": 1000,
-    "output_tokens": 250,
-    "total_tokens": 1250
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0
   },
   "status": "finished"
 }
@@ -726,15 +679,11 @@ Useful lower-level helpers:
 
 ## Development
 
-Run the tests before and after router changes:
+Run the full regression suite:
 
 ```bash
 python -m unittest tests/test_router.py
 ```
-
-The tests use `unittest` and `unittest.mock`; they do not require live provider
-access. Mock model calls with `mock.patch.object(r, "generate_text", ...)` when
-adding new tests.
 
 Useful focused checks:
 
@@ -746,37 +695,41 @@ python -m unittest tests.test_router.FinalizerTests
 python -m unittest tests.test_router.RouterGraphIntegrationTests
 ```
 
-## Testing Strategy
+Regenerate the architecture diagram after changing graph nodes:
+
+```bash
+python scripts/render_super_router_diagram.py
+```
+
+The renderer raises an error if `EXPECTED_GRAPH_NODES` in
+`scripts/render_super_router_diagram.py` is stale relative to
+`build_router_graph()`.
 
 Current tests cover:
 
 - environment parsing and default state construction
-- JSON extraction and planner normalization
-- communication subtask splitting
-- contextual routing biases
-- Gemini timeout forwarding
-- provider token usage parsing and run-level accounting
-- stream event helpers
-- provider fallback retries and capability stop behavior
+- LangSmith configuration and trace redaction helpers
+- planner JSON extraction and subtask normalization
+- planner context compaction for long tasks
+- dependency judgment and DAG validation behavior
+- bounded context packs for judge, executor, metadata, and finalizer prompts
+- provider selection for Gemini, Codex, Claude, and Ollama
+- provider usage metadata extraction
+- provider fallback retry and capability-stop behavior
+- token usage tracking and JSONL ledger persistence
 - FLASH review, retry, and escalation guards
 - metadata extraction behavior
-- finalizer timeout and model path checks
-- full mocked graph success path
-- FLASH quality escalation to PRO
-- streamed graph execution
+- finalizer timeout, verification, and fallback behavior
+- full mocked graph success, FLASH escalation, dependency-aware concurrency,
+  dependency blocking, and streamed execution
 
-When changing router logic, add regression coverage for:
-
-- route decisions and score normalization
-- provider fallback order
-- new environment variables or default values
-- stream output summaries
-- finalizer fallback behavior
-- any new graph edge or state field
+When changing router logic, add regression coverage for new route decisions,
+environment variables, graph nodes or edges, fallback order, token accounting,
+stream output, and finalizer behavior.
 
 ## Troubleshooting
 
-### Task description required
+### Task Description Required
 
 Provide a positional task or set `ROUTER_TASK`:
 
@@ -784,7 +737,7 @@ Provide a positional task or set `ROUTER_TASK`:
 ROUTER_TASK="Summarize the router graph" python scripts/router.py
 ```
 
-### Gemini CLI executable was not found
+### Gemini CLI Executable Was Not Found
 
 Install Gemini CLI or set:
 
@@ -792,7 +745,7 @@ Install Gemini CLI or set:
 export ROUTER_GEMINI_CLI=/path/to/gemini
 ```
 
-### Claude CLI executable was not found
+### Claude CLI Executable Was Not Found
 
 Install Claude Code CLI or set:
 
@@ -800,10 +753,19 @@ Install Claude Code CLI or set:
 export ROUTER_CLAUDE_CLI=/path/to/claude
 ```
 
-### Gemini network preflight failed
+### Codex CLI Executable Was Not Found
 
-The router checks access to Google endpoints before invoking Gemini CLI when no
-proxy is configured. If your environment requires a proxy, configure one of:
+Install Codex CLI or set:
+
+```bash
+export ROUTER_CODEX_CLI=/path/to/codex
+```
+
+### Gemini Network Preflight Failed
+
+Before invoking Gemini CLI, the router checks connectivity to required Google
+endpoints when no proxy is configured. If your environment requires a proxy,
+configure one of:
 
 ```bash
 export HTTPS_PROXY=http://proxy.example:8080
@@ -811,7 +773,7 @@ export HTTP_PROXY=http://proxy.example:8080
 export ALL_PROXY=socks5://proxy.example:1080
 ```
 
-### Unable to reach Ollama
+### Unable To Reach Ollama
 
 Start Ollama and confirm the endpoint:
 
@@ -820,84 +782,50 @@ ollama serve
 export ROUTER_OLLAMA_URL=http://localhost:11434/api/generate
 ```
 
-### Planner or judge is slow
+### Planner Or Judge Is Slow
 
-Large local models can take minutes, especially on first load. Use streaming and
-serialize judge/executor fanout:
+Large local models can take minutes, especially on first load. Use streaming
+and serialize fanout:
 
 ```bash
 export ROUTER_MAX_CONCURRENCY=1
-python scripts/router.py --stream "Analyze production K8s incident and draft summary"
+python scripts/router.py --stream "Analyze a complex task and draft a summary"
 ```
 
-When opting into local models, keep the planner strong and the judge smaller:
+Skip warmup pings during local iteration:
 
 ```bash
-export ROUTER_PLANNER_MODEL=gemma4:26b
-export ROUTER_JUDGE_MODEL=llama3.1:8b
+export ROUTER_SKIP_WARMUP=1
 ```
 
-### FLASH keeps escalating to PRO
+### FLASH Keeps Escalating To PRO
 
-This usually means the FLASH output failed the quality guard or the task was
-not actually simple reporting work. Try a stronger FLASH model or inspect the
-`flash_review` field in `state["results"]`.
+Inspect `flash_review` in `state["results"]`. Common reasons are empty output,
+very short non-summary output, "need more context" style responses, or an
+infrastructure failure that exhausted the retry budget.
 
-### Finalizer falls back to the deterministic report
+### Finalizer Uses The Deterministic Report
 
-Check `finalizer_outcome`, `finalizer_error`, and `finalizer_attempt_log` in the
-returned state. Common causes are provider timeouts, authentication failures,
-or short/empty finalizer output.
-
-## Example Workflows
-
-### Incident triage
-
-```bash
-python scripts/router.py --stream \
-  "Analyze production K8s pod restarts, identify root cause, propose a fix, and prepare an on-call action summary"
-```
-
-Expected behavior:
-
-- log inspection and root-cause work routes to PRO
-- repair planning routes to PRO
-- final on-call summary routes to FLASH unless it requires new analysis
-
-### Code refactor
-
-```bash
-python scripts/router.py \
-  "Refactor auth module to use JWT, add unit tests, and update docs"
-```
-
-Expected behavior:
-
-- implementation and test design routes to PRO
-- documentation-only update can route to FLASH
-
-### Simple summary
-
-```bash
-python scripts/router.py "Summarize the last 10 git commits"
-```
-
-Expected behavior:
-
-- summary-like work routes to FLASH
+Inspect `finalizer_outcome`, `finalizer_error`, and
+`finalizer_attempt_log`. Common causes are provider timeouts, authentication
+failures, short finalizer output, or FLASH and PRO resolving to the same
+effective model path after a non-capability FLASH failure.
 
 ## Security Notes
 
-- Do not commit local model credentials, private endpoint URLs, or Gemini CLI
-  authentication artifacts.
-- Use environment variables for local overrides.
-- Keep tests deterministic and offline by mocking `generate_text()`.
-- Treat PRO/FLASH outputs as model-generated text; downstream automation should
-  validate before making irreversible changes.
+- Do not commit credentials, private endpoints, or provider authentication
+  artifacts.
+- Keep provider configuration in environment variables or `~/.hermes/.env`.
+- Leave prompt and output tracing disabled for sensitive workloads unless you
+  explicitly need previews.
+- Treat model outputs as untrusted text; validate before automating
+  irreversible operations.
+- Keep tests offline by mocking provider calls.
 
 ## Related Documentation
 
-- `SKILL.md` for Hermes-specific usage instructions.
+- `SKILL.md` for Hermes-specific invocation guidance.
+- `references/` for supplemental operational notes.
 - LangGraph documentation: https://langchain-ai.github.io/langgraph/
 - Ollama documentation: https://ollama.com/docs
 - Gemini CLI headless JSON output: https://google-gemini.github.io/gemini-cli/docs/cli/headless.html
