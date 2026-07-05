@@ -148,27 +148,36 @@ All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime 
 |----------|---------|---------|
 | `ROUTER_MODEL` | Global model default for planner, judge, PRO, and FLASH roles | None |
 | `ROUTER_PLANNER_MODEL` | Task decomposition model | internal default |
+| `ROUTER_WARMUP_TIMEOUT` | Timeout for planner and judge warmup pings (seconds) | 60 |
+| `ROUTER_PLANNER_TIMEOUT` | Timeout for planner task decomposition (seconds) | 300 |
 | `ROUTER_PLANNER_TASK_CHAR_LIMIT` | Character budget for the compact planner-only context manifest JSON | 6000 |
 | `ROUTER_PLANNER_MAX_OUTPUT_TOKENS` | Planner JSON subtask output token cap | 4096 |
 | `ROUTER_JUDGE_CONTEXT_CHAR_LIMIT` | Character budget for judge context JSON | 3000 |
 | `ROUTER_EXECUTOR_CONTEXT_CHAR_LIMIT` | Character budget for executor context JSON | 8000 |
+| `ROUTER_EXECUTOR_TIMEOUT` | Shared timeout for PRO and FLASH executor branches (seconds) | 300 |
+| `ROUTER_PRO_EXECUTOR_TIMEOUT` | PRO executor timeout override (seconds) | `ROUTER_EXECUTOR_TIMEOUT` |
+| `ROUTER_FLASH_EXECUTOR_TIMEOUT` | FLASH executor timeout override (seconds) | `ROUTER_EXECUTOR_TIMEOUT` |
 | `ROUTER_METADATA_OUTPUT_CHAR_LIMIT` | Character budget for metadata extraction context JSON and output excerpts | 6000 |
+| `ROUTER_METADATA_TIMEOUT` | Timeout for technical metadata extraction (seconds) | 120 |
 | `ROUTER_FINALIZER_CONTEXT_CHAR_LIMIT` | Character budget for finalizer context JSON | 12000 |
 | `ROUTER_JUDGE_MODEL` | Complexity scoring model | internal default |
 | `ROUTER_PRO_MODEL` | Heavy reasoning executor | internal default |
 | `ROUTER_FLASH_MODEL` | Fast executor | internal default |
 | `ROUTER_PRO_FALLBACK_MODELS` | Comma-separated PRO fallback list | None |
 | `ROUTER_FLASH_FALLBACK_MODELS` | Comma-separated FLASH fallback list | None |
+| `ROUTER_MAX_PROVIDER_ATTEMPTS` | Max provider candidates per model call, including primary | 3 |
 | `ROUTER_CODEX_CLI` | Codex CLI executable path for Codex-backed model names | first `codex` on `PATH`, else `codex` |
 | `ROUTER_CODEX_CWD` | Optional working directory passed to `codex exec --cd` | None |
 | `ROUTER_CODEX_SANDBOX` | Sandbox mode passed to `codex exec --sandbox` | `read-only` |
 | `ROUTER_CLAUDE_CLI` | Claude Code CLI executable path for Claude-backed model names | first `claude` on `PATH`, else `claude` |
+| `ROUTER_PROVIDER_TERMINATION_GRACE` | Seconds to wait after SIGTERM before SIGKILL for timed-out provider CLIs | 5 |
 | `ROUTER_FLASH_RETRY_BUDGET` | Max FLASH retries before escalation | 1 |
 | `ROUTER_RECURSION_LIMIT` | Python recursion limit | 128 |
+| `ROUTER_RUN_TIMEOUT` | Whole-run deadline in seconds; `0` disables it | 7200 |
 | `ROUTER_JUDGE_TIMEOUT` | Timeout for Judge node LLM calls (seconds) | 300 |
 | `ROUTER_MAX_CONCURRENCY` | Max concurrent LangGraph branches for judge and executor fanout | Auto |
 | `ROUTER_OLLAMA_URL` | Ollama API endpoint (if used) | `http://localhost:11434/api/generate` |
-| `ROUTER_FINALIZER_TIMEOUT` | Timeout for the final reporting synthesis (seconds) | 600 |
+| `ROUTER_FINALIZER_TIMEOUT` | Timeout for the final reporting synthesis (seconds) | 300 |
 | `ROUTER_DEBUG` | Print raw diagnostic snippets | Off |
 | `ROUTER_LANGSMITH_ENABLED` | Enable optional LangSmith graph and model-call telemetry when `LANGSMITH_API_KEY` is set | Off |
 | `ROUTER_LANGSMITH_PROJECT` | LangSmith project name | `super-router` |

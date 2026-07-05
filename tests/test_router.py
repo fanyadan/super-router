@@ -560,10 +560,11 @@ class RouterHelperTests(unittest.TestCase):
             )
             stderr = ""
 
-        def fake_run(command, *, capture_output, text, timeout, env, check, stdin):
+        def fake_cli(command, *, input_text=None, timeout, env, label):
             captured["command"] = command
+            captured["input_text"] = input_text
             captured["timeout"] = timeout
-            captured["stdin"] = stdin
+            captured["label"] = label
             with open(env[r.GEMINI_SYSTEM_SETTINGS_ENV_VAR], "r", encoding="utf-8") as settings_file:
                 captured["settings"] = json.load(settings_file)
             return FakeResult()
@@ -572,7 +573,7 @@ class RouterHelperTests(unittest.TestCase):
             mock.patch.object(r, "GEMINI_CLI_PATH", "/tmp/gemini"),
             mock.patch.object(r.os.path, "exists", return_value=True),
             mock.patch.dict(os.environ, {r.GEMINI_SYSTEM_SETTINGS_ENV_VAR: ""}, clear=False),
-            mock.patch.object(r.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(r, "run_provider_cli", side_effect=fake_cli),
         ):
             result = r.invoke_gemini_cli_with_usage(
                 "google-gemini-cli/gemini-3-pro-preview",
@@ -588,8 +589,9 @@ class RouterHelperTests(unittest.TestCase):
         )
         override = captured["settings"]["modelConfigs"]["customOverrides"][-1]
         self.assertEqual(captured["command"][2], "gemini-3-pro-preview")
+        self.assertIsNone(captured["input_text"])
         self.assertEqual(captured["timeout"], 30)
-        self.assertEqual(captured["stdin"], r.subprocess.DEVNULL)
+        self.assertEqual(captured["label"], "Gemini CLI gemini-3-pro-preview")
         self.assertEqual(override["match"], {"model": "gemini-3-pro-preview"})
         self.assertEqual(override["modelConfig"]["generateContentConfig"]["temperature"], 0.0)
 
@@ -611,16 +613,18 @@ class RouterHelperTests(unittest.TestCase):
             )
             stderr = ""
 
-        def fake_run(command, *, capture_output, text, timeout, env, check):
+        def fake_cli(command, *, input_text=None, timeout, env, label):
             captured["command"] = command
+            captured["input_text"] = input_text
             captured["timeout"] = timeout
             captured["env"] = env
+            captured["label"] = label
             return FakeResult()
 
         with (
             mock.patch.object(r, "CLAUDE_CLI_PATH", "/tmp/claude"),
             mock.patch.object(r.os.path, "exists", return_value=True),
-            mock.patch.object(r.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(r, "run_provider_cli", side_effect=fake_cli),
         ):
             result = r.claude_generate_with_usage(
                 "claude/sonnet",
@@ -643,8 +647,10 @@ class RouterHelperTests(unittest.TestCase):
             captured["command"],
             ["/tmp/claude", "--model", "sonnet", "--output-format", "json", "-p", "prompt"],
         )
+        self.assertIsNone(captured["input_text"])
         self.assertEqual(captured["timeout"], 30)
         self.assertEqual(captured["env"]["NO_COLOR"], "1")
+        self.assertEqual(captured["label"], "Claude CLI sonnet")
 
     def test_extract_claude_usage_metadata_accepts_model_usage_and_legacy_fields(self):
         self.assertEqual(
@@ -745,11 +751,12 @@ class RouterHelperTests(unittest.TestCase):
             stdout = "ignored stdout"
             stderr = ""
 
-        def fake_run(command, *, input, capture_output, text, timeout, env, check):
+        def fake_cli(command, *, input_text=None, timeout, env, label):
             captured["command"] = command
-            captured["input"] = input
+            captured["input_text"] = input_text
             captured["timeout"] = timeout
             captured["env_no_color"] = env["NO_COLOR"]
+            captured["label"] = label
             output_path = command[command.index("--output-last-message") + 1]
             with open(output_path, "w", encoding="utf-8") as output_file:
                 output_file.write("codex output")
@@ -766,7 +773,7 @@ class RouterHelperTests(unittest.TestCase):
             ),
             mock.patch.object(r, "CODEX_CLI_PATH", "/tmp/codex"),
             mock.patch.object(r.os.path, "exists", return_value=True),
-            mock.patch.object(r.subprocess, "run", side_effect=fake_run),
+            mock.patch.object(r, "run_provider_cli", side_effect=fake_cli),
         ):
             result = r.codex_generate_with_usage(
                 "codex/gpt-5.5",
@@ -784,14 +791,126 @@ class RouterHelperTests(unittest.TestCase):
         self.assertEqual(captured["command"][-1], "-")
         self.assertEqual(captured["command"][captured["command"].index("--cd") + 1], "/tmp/codex-work")
         self.assertEqual(captured["command"][captured["command"].index("--sandbox") + 1], "read-only")
-        self.assertEqual(captured["input"], "prompt")
+        self.assertEqual(captured["input_text"], "prompt")
         self.assertEqual(captured["timeout"], 11)
         self.assertEqual(captured["env_no_color"], "1")
+        self.assertEqual(captured["label"], "Codex CLI gpt-5.5")
         self.assertEqual(result["text"], "codex output")
         self.assertEqual(result["provider"], "codex")
         self.assertEqual(result["model_name"], "gpt-5.5")
         self.assertEqual(result["usage_source"], "unavailable")
         self.assertEqual(result["usage_metadata"], {})
+
+    def test_run_provider_cli_uses_process_group_and_kills_on_timeout(self):
+        captured = {"communicate_inputs": [], "communicate_timeouts": []}
+
+        class FakeProcess:
+            pid = 12345
+            returncode = None
+
+            def __init__(self):
+                self.communicate_calls = 0
+
+            def communicate(self, input=None, timeout=None):
+                captured["communicate_inputs"].append(input)
+                captured["communicate_timeouts"].append(timeout)
+                self.communicate_calls += 1
+                if self.communicate_calls == 1:
+                    raise r.subprocess.TimeoutExpired(["provider"], timeout)
+                self.returncode = -15
+                return "", ""
+
+            def terminate(self):
+                captured["terminated"] = True
+
+            def kill(self):
+                captured["killed"] = True
+
+        def fake_popen(command, **kwargs):
+            captured["command"] = command
+            captured["popen_kwargs"] = kwargs
+            return FakeProcess()
+
+        with (
+            mock.patch.object(r.subprocess, "Popen", side_effect=fake_popen),
+            mock.patch.object(r.os, "killpg") as killpg,
+            mock.patch.dict(os.environ, {"ROUTER_PROVIDER_TERMINATION_GRACE": "2"}, clear=False),
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                r.run_provider_cli(
+                    ["provider"],
+                    input_text="payload",
+                    timeout=7,
+                    env={},
+                    label="Provider Test",
+                )
+
+        self.assertIn("timed out after 7s", str(raised.exception))
+        self.assertEqual(captured["command"], ["provider"])
+        self.assertEqual(captured["popen_kwargs"]["stdin"], r.subprocess.PIPE)
+        self.assertEqual(captured["communicate_inputs"], ["payload", None])
+        self.assertEqual(captured["communicate_timeouts"], [7, 2])
+        if r.os.name == "posix":
+            killpg.assert_called_once_with(12345, r.signal.SIGTERM)
+
+    def test_run_deadline_caps_generate_text_timeout(self):
+        captured = {}
+
+        def fake_generate(model, prompt, *, timeout, num_predict, temperature, usage_label):
+            captured["timeout"] = timeout
+            return r.build_text_generation_result("ok", {}, "test", model, "unavailable")
+
+        with r.router_run_deadline_context(5):
+            with mock.patch.object(r, "_execute_generate_text_with_usage", side_effect=fake_generate):
+                self.assertEqual(
+                    r.generate_text("ollama/test", "prompt", timeout=300, usage_label="deadline"),
+                    "ok",
+                )
+
+        self.assertGreaterEqual(captured["timeout"], 1)
+        self.assertLessEqual(captured["timeout"], 5)
+
+    def test_executor_timeout_env_is_used(self):
+        captured = {}
+        state = r.create_initial_state("executor timeout", pro_model="pro")
+        subtask = {
+            "id": "S1",
+            "desc": "Inspect timeout behavior",
+            "depends_on": [],
+            "dependency_reason": "Independent.",
+            "model": r.PRO,
+            "assessment": r.build_fallback_assessment("executor timeout", "Inspect timeout behavior"),
+        }
+
+        def fake_invoke(primary_model, fallback_models, prompt, *, timeout, num_predict, temperature, label, attempt_log=None):
+            captured["timeout"] = timeout
+            return {
+                "success": True,
+                "output": "executor output",
+                "model_name": primary_model,
+                "used_provider_fallback": False,
+                "failure_type": "none",
+                "error_text": "",
+                "attempt_log": list(attempt_log or []),
+            }
+
+        with (
+            mock.patch.dict(os.environ, {"ROUTER_EXECUTOR_TIMEOUT": "19"}, clear=False),
+            mock.patch.object(r, "invoke_with_provider_fallback", side_effect=fake_invoke),
+        ):
+            r.invoke_parallel_executor_attempt(
+                state,
+                1,
+                subtask,
+                r.PRO,
+                0,
+                0,
+                False,
+                r.empty_flash_review(),
+                [],
+            )
+
+        self.assertEqual(captured["timeout"], 19)
 
     def test_token_usage_tracking_records_generate_text_calls(self):
         def fake_gemini(model, prompt, *, timeout, temperature):
@@ -935,6 +1054,31 @@ class ProviderFallbackTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["failure_type"], "capability_quality")
         self.assertEqual(calls, ["primary"])
+
+    def test_provider_fallback_attempts_are_capped(self):
+        calls = []
+
+        def fake_generate(model, prompt, **kwargs):
+            calls.append(model)
+            raise RuntimeError("connection reset by provider")
+
+        with (
+            mock.patch.dict(os.environ, {"ROUTER_MAX_PROVIDER_ATTEMPTS": "2"}, clear=False),
+            mock.patch.object(r, "generate_text", side_effect=fake_generate),
+        ):
+            result = r.invoke_with_provider_fallback(
+                "primary",
+                ["fallback-a", "fallback-b"],
+                "prompt",
+                timeout=5,
+                num_predict=10,
+                temperature=0.0,
+                label="test",
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(calls, ["primary", "fallback-a"])
+        self.assertIn("limited to 2/3", " ".join(result["attempt_log"]))
 
 
 class FlashReviewAndMetadataTests(unittest.TestCase):

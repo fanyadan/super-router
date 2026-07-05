@@ -10,11 +10,13 @@ import operator
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -361,16 +363,29 @@ DEFAULT_FLASH_RETRY_BUDGET = 1
 MIN_NON_SUMMARY_OUTPUT_CHARS = 48
 DEFAULT_ROUTER_RECURSION_LIMIT = 128
 DEFAULT_LARGE_MODEL_TIMEOUT = 6000
-#DEFAULT_PRO_EXECUTION_TIMEOUT = 45
-DEFAULT_PRO_EXECUTION_TIMEOUT = 6000
-#DEFAULT_FLASH_EXECUTION_TIMEOUT = 30
-DEFAULT_FLASH_EXECUTION_TIMEOUT = 6000
-DEFAULT_PRO_FINALIZER_TIMEOUT = 6000
-DEFAULT_FLASH_FINALIZER_TIMEOUT = 6000
+DEFAULT_WARMUP_TIMEOUT = 60
+DEFAULT_PLANNER_TIMEOUT = 300
+DEFAULT_PRO_EXECUTION_TIMEOUT = 300
+DEFAULT_FLASH_EXECUTION_TIMEOUT = 300
+DEFAULT_METADATA_TIMEOUT = 120
+DEFAULT_PRO_FINALIZER_TIMEOUT = 300
+DEFAULT_FLASH_FINALIZER_TIMEOUT = 300
+DEFAULT_ROUTER_RUN_TIMEOUT = 7200
+DEFAULT_MAX_PROVIDER_ATTEMPTS = 3
+DEFAULT_PROVIDER_TERMINATION_GRACE = 5
 DEFAULT_PRO_MODEL = "google-gemini-cli/gemini-3-pro-preview"
 DEFAULT_FLASH_MODEL = "google-gemini-cli/gemini-3-flash-preview"
 DEFAULT_PLANNER_MODEL = DEFAULT_PRO_MODEL
 DEFAULT_JUDGE_MODEL = DEFAULT_FLASH_MODEL
+ROUTER_WARMUP_TIMEOUT_ENV_VAR = "ROUTER_WARMUP_TIMEOUT"
+ROUTER_PLANNER_TIMEOUT_ENV_VAR = "ROUTER_PLANNER_TIMEOUT"
+ROUTER_EXECUTOR_TIMEOUT_ENV_VAR = "ROUTER_EXECUTOR_TIMEOUT"
+ROUTER_PRO_EXECUTOR_TIMEOUT_ENV_VAR = "ROUTER_PRO_EXECUTOR_TIMEOUT"
+ROUTER_FLASH_EXECUTOR_TIMEOUT_ENV_VAR = "ROUTER_FLASH_EXECUTOR_TIMEOUT"
+ROUTER_METADATA_TIMEOUT_ENV_VAR = "ROUTER_METADATA_TIMEOUT"
+ROUTER_RUN_TIMEOUT_ENV_VAR = "ROUTER_RUN_TIMEOUT"
+ROUTER_MAX_PROVIDER_ATTEMPTS_ENV_VAR = "ROUTER_MAX_PROVIDER_ATTEMPTS"
+ROUTER_PROVIDER_TERMINATION_GRACE_ENV_VAR = "ROUTER_PROVIDER_TERMINATION_GRACE"
 ROUTER_PLANNER_TASK_CHAR_LIMIT_ENV_VAR = "ROUTER_PLANNER_TASK_CHAR_LIMIT"
 ROUTER_PLANNER_MAX_OUTPUT_TOKENS_ENV_VAR = "ROUTER_PLANNER_MAX_OUTPUT_TOKENS"
 ROUTER_JUDGE_CONTEXT_CHAR_LIMIT_ENV_VAR = "ROUTER_JUDGE_CONTEXT_CHAR_LIMIT"
@@ -386,6 +401,11 @@ DEFAULT_FINALIZER_CONTEXT_CHAR_LIMIT = 12000
 GEMINI_PREFLIGHT_RESULTS: Dict[str, str] = {}
 GEMINI_NETWORK_PREFLIGHT_RESULT: str | None = None
 TOKEN_USAGE_RUN_ID: contextvars.ContextVar[str] = contextvars.ContextVar("TOKEN_USAGE_RUN_ID", default="")
+RUN_DEADLINE_MONOTONIC: contextvars.ContextVar[float] = contextvars.ContextVar(
+    "RUN_DEADLINE_MONOTONIC",
+    default=0.0,
+)
+GLOBAL_RUN_DEADLINE_MONOTONIC = 0.0
 TOKEN_USAGE_LOCK = threading.RLock()
 TOKEN_USAGE_RECORDS_BY_RUN: Dict[str, List["TokenUsageRecord"]] = {}
 TOKEN_USAGE_ACTIVE_RUN_IDS: set[str] = set()
@@ -656,6 +676,58 @@ def router_debug_enabled() -> bool:
     return resolve_bool("ROUTER_DEBUG")
 
 
+def resolve_executor_timeout(route: Literal["PRO", "FLASH"]) -> int:
+    default_timeout = DEFAULT_PRO_EXECUTION_TIMEOUT if route == PRO else DEFAULT_FLASH_EXECUTION_TIMEOUT
+    route_env = (
+        ROUTER_PRO_EXECUTOR_TIMEOUT_ENV_VAR
+        if route == PRO
+        else ROUTER_FLASH_EXECUTOR_TIMEOUT_ENV_VAR
+    )
+    shared_timeout = resolve_positive_int(None, ROUTER_EXECUTOR_TIMEOUT_ENV_VAR, default_timeout)
+    return resolve_positive_int(None, route_env, shared_timeout)
+
+
+def current_run_deadline() -> float:
+    return RUN_DEADLINE_MONOTONIC.get() or GLOBAL_RUN_DEADLINE_MONOTONIC
+
+
+def check_run_deadline() -> None:
+    deadline = current_run_deadline()
+    if deadline and time.monotonic() >= deadline:
+        raise RuntimeError("Router run deadline exceeded.")
+
+
+def timeout_with_run_deadline(timeout: int) -> int:
+    check_run_deadline()
+    deadline = current_run_deadline()
+    if not deadline:
+        return max(1, timeout)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("Router run deadline exceeded.")
+    return max(1, min(max(1, timeout), int(remaining + 0.999)))
+
+
+@contextlib.contextmanager
+def router_run_deadline_context(timeout: int) -> Iterator[None]:
+    global GLOBAL_RUN_DEADLINE_MONOTONIC
+
+    if timeout <= 0:
+        yield
+        return
+
+    deadline = time.monotonic() + timeout
+    token = RUN_DEADLINE_MONOTONIC.set(deadline)
+    previous_global_deadline = GLOBAL_RUN_DEADLINE_MONOTONIC
+    GLOBAL_RUN_DEADLINE_MONOTONIC = deadline
+    print(f"[Router Deadline] Whole-run deadline enabled: {timeout}s.")
+    try:
+        yield
+    finally:
+        RUN_DEADLINE_MONOTONIC.reset(token)
+        GLOBAL_RUN_DEADLINE_MONOTONIC = previous_global_deadline
+
+
 def resolve_model_list(explicit_values: List[str] | None, env_name: str) -> List[str]:
     raw_values = explicit_values
     if raw_values is None:
@@ -689,6 +761,89 @@ def compact_text_middle(text: str, limit: int) -> str:
     head_size = max(1, available // 2)
     tail_size = max(1, available - head_size)
     return f"{one_line[:head_size].rstrip()}{marker}{one_line[-tail_size:].lstrip()}"
+
+
+def provider_cli_name(command: List[str]) -> str:
+    if not command:
+        return "provider-cli"
+    return os.path.basename(command[0]) or command[0]
+
+
+def terminate_provider_process(process: subprocess.Popen, label: str, grace_timeout: int) -> None:
+    print(f"[Provider CLI] {label}: timeout reached; terminating process group for pid={process.pid}.")
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            process.terminate()
+    else:
+        process.terminate()
+
+    try:
+        process.communicate(timeout=grace_timeout)
+        return
+    except subprocess.TimeoutExpired:
+        print(f"[Provider CLI] {label}: process group ignored SIGTERM; sending SIGKILL.")
+
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except OSError:
+            process.kill()
+    else:
+        process.kill()
+    process.communicate()
+
+
+def run_provider_cli(
+    command: List[str],
+    *,
+    input_text: str | None = None,
+    timeout: int,
+    env: Dict[str, str],
+    label: str,
+) -> subprocess.CompletedProcess:
+    effective_timeout = timeout_with_run_deadline(timeout)
+    grace_timeout = resolve_positive_int(
+        None,
+        ROUTER_PROVIDER_TERMINATION_GRACE_ENV_VAR,
+        DEFAULT_PROVIDER_TERMINATION_GRACE,
+    )
+    stdin = subprocess.PIPE if input_text is not None else subprocess.DEVNULL
+    popen_kwargs: Dict[str, Any] = {
+        "stdin": stdin,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "env": env,
+    }
+    if os.name == "posix":
+        popen_kwargs["start_new_session"] = True
+    elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    print(
+        f"[Provider CLI] {label}: launching {provider_cli_name(command)} "
+        f"timeout={effective_timeout}s."
+    )
+    process = subprocess.Popen(command, **popen_kwargs)
+    try:
+        stdout, stderr = process.communicate(input=input_text, timeout=effective_timeout)
+    except subprocess.TimeoutExpired as exc:
+        terminate_provider_process(process, label, grace_timeout)
+        raise RuntimeError(f"{label} timed out after {effective_timeout}s") from exc
+
+    print(f"[Provider CLI] {label}: exit={process.returncode}.")
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout or "",
+        stderr or "",
+    )
 
 
 PLANNER_RELEVANT_TASK_KEYWORDS = (
@@ -1891,6 +2046,18 @@ def invoke_with_provider_fallback(
     attempt_log: List[str] | None = None,
 ) -> ModelInvocationResult:
     candidates = dedupe_model_sequence(primary_model, fallback_models)
+    initial_log = list(attempt_log or [])
+    max_attempts = resolve_positive_int(
+        None,
+        ROUTER_MAX_PROVIDER_ATTEMPTS_ENV_VAR,
+        DEFAULT_MAX_PROVIDER_ATTEMPTS,
+    )
+    if len(candidates) > max_attempts:
+        initial_log.append(
+            f"{label} provider candidates limited to {max_attempts}/"
+            f"{len(candidates)} by {ROUTER_MAX_PROVIDER_ATTEMPTS_ENV_VAR}."
+        )
+        candidates = candidates[:max_attempts]
     initial_state: ModelInvocationState = {
         "primary_model": primary_model,
         "candidates": candidates,
@@ -1901,7 +2068,7 @@ def invoke_with_provider_fallback(
         "num_predict": num_predict,
         "temperature": temperature,
         "label": label,
-        "log": list(attempt_log or []),
+        "log": initial_log,
         "errors": [],
         "result": empty_model_invocation_result(primary_model),
         "status": "provider_created",
@@ -2975,24 +3142,18 @@ def invoke_gemini_cli_with_usage(
 #        "-e",
 #        GEMINI_EXTENSION_NAME,
     ]
-    try:
-        with tempfile.TemporaryDirectory(prefix="router-gemini-") as settings_dir:
-            settings_path = os.path.join(settings_dir, "settings.json")
-            with open(settings_path, "w", encoding="utf-8") as settings_file:
-                json.dump(build_gemini_temperature_settings(normalized_model, temperature), settings_file)
-            env[GEMINI_SYSTEM_SETTINGS_ENV_VAR] = settings_path
+    with tempfile.TemporaryDirectory(prefix="router-gemini-") as settings_dir:
+        settings_path = os.path.join(settings_dir, "settings.json")
+        with open(settings_path, "w", encoding="utf-8") as settings_file:
+            json.dump(build_gemini_temperature_settings(normalized_model, temperature), settings_file)
+        env[GEMINI_SYSTEM_SETTINGS_ENV_VAR] = settings_path
 
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-                check=False,
-                stdin=subprocess.DEVNULL,
-            )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Gemini CLI timed out after {timeout}s") from exc
+        result = run_provider_cli(
+            command,
+            timeout=timeout,
+            env=env,
+            label=f"Gemini CLI {normalized_model}",
+        )
 
     stdout = result.stdout.strip()
     stderr = result.stderr.strip()
@@ -3162,25 +3323,20 @@ def codex_generate_with_usage(
     if codex_cwd:
         command.extend(["--cd", codex_cwd])
 
-    try:
-        with tempfile.TemporaryDirectory(prefix="router-codex-") as output_dir:
-            output_path = os.path.join(output_dir, "last-message.txt")
-            command.extend(["--output-last-message", output_path, "-"])
-            result = subprocess.run(
-                command,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-                check=False,
-            )
-            output_text = ""
-            if os.path.exists(output_path):
-                with open(output_path, "r", encoding="utf-8") as output_file:
-                    output_text = output_file.read().strip()
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Codex CLI timed out after {timeout}s") from exc
+    with tempfile.TemporaryDirectory(prefix="router-codex-") as output_dir:
+        output_path = os.path.join(output_dir, "last-message.txt")
+        command.extend(["--output-last-message", output_path, "-"])
+        result = run_provider_cli(
+            command,
+            input_text=prompt,
+            timeout=timeout,
+            env=env,
+            label=f"Codex CLI {normalized_model}",
+        )
+        output_text = ""
+        if os.path.exists(output_path):
+            with open(output_path, "r", encoding="utf-8") as output_file:
+                output_text = output_file.read().strip()
 
     stdout = result.stdout.strip()
     stderr = result.stderr.strip()
@@ -3323,17 +3479,12 @@ def claude_generate_with_usage(
     env["NO_COLOR"] = "1"
     command = [CLAUDE_CLI_PATH, "--model", normalized_model, "--output-format", "json", "-p", prompt]
 
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Claude CLI timed out after {timeout}s") from exc
+    result = run_provider_cli(
+        command,
+        timeout=timeout,
+        env=env,
+        label=f"Claude CLI {normalized_model}",
+    )
 
     stdout = result.stdout.strip()
     stderr = result.stderr.strip()
@@ -3428,11 +3579,12 @@ def generate_text(
     temperature: float = 0.0,
     usage_label: str = "",
 ) -> str:
+    effective_timeout = timeout_with_run_deadline(timeout)
     if langsmith_tracing_configured():
         result = _traced_generate_text(
             model,
             prompt,
-            timeout=timeout,
+            timeout=effective_timeout,
             num_predict=num_predict,
             temperature=temperature,
             usage_label=usage_label,
@@ -3447,7 +3599,7 @@ def generate_text(
     result = _execute_generate_text_with_usage(
         model,
         prompt,
-        timeout=timeout,
+        timeout=effective_timeout,
         num_predict=num_predict,
         temperature=temperature,
         usage_label=usage_label,
@@ -4255,7 +4407,7 @@ def planner_warmup_node(state: RouterState) -> Dict[str, Any]:
         generate_text(
             state["planner_model"],
             "OK",
-            timeout=300,
+            timeout=resolve_positive_int(None, ROUTER_WARMUP_TIMEOUT_ENV_VAR, DEFAULT_WARMUP_TIMEOUT),
             num_predict=4,
             usage_label=f"Planner warmup {attempt}",
         )
@@ -4285,7 +4437,7 @@ def planner_invoke_node(state: RouterState) -> Dict[str, Any]:
         raw_text = generate_text(
             state["planner_model"],
             build_planner_prompt(state["task"]),
-            timeout=300,  # 5 minutes for large models like gemma4:26b
+            timeout=resolve_positive_int(None, ROUTER_PLANNER_TIMEOUT_ENV_VAR, DEFAULT_PLANNER_TIMEOUT),
             num_predict=planner_output_tokens,
             usage_label="Planner invoke",
         )
@@ -4440,7 +4592,7 @@ def judge_warmup_node(state: RouterState) -> Dict[str, Any]:
         generate_text(
             state["judge_model"],
             "OK",
-            timeout=300,
+            timeout=resolve_positive_int(None, ROUTER_WARMUP_TIMEOUT_ENV_VAR, DEFAULT_WARMUP_TIMEOUT),
             num_predict=4,
             usage_label="Judge warmup",
         )
@@ -4550,7 +4702,7 @@ def extract_technical_metadata_for_result(state: RouterState, result: StepResult
         state["pro_model"],
         state["pro_fallback_models"],
         prompt,
-        timeout=120,
+        timeout=resolve_positive_int(None, ROUTER_METADATA_TIMEOUT_ENV_VAR, DEFAULT_METADATA_TIMEOUT),
         num_predict=800,
         temperature=0.0,
         label="Metadata Extractor",
@@ -4715,7 +4867,7 @@ def invoke_parallel_executor_attempt(
         model_name,
         route_fallback_models(state, route),
         build_execution_prompt(prompt_state, route),
-        timeout=DEFAULT_PRO_EXECUTION_TIMEOUT if route == PRO else DEFAULT_FLASH_EXECUTION_TIMEOUT,
+        timeout=resolve_executor_timeout(route),
         num_predict=450 if route == PRO else 240,
         temperature=0.0,
         label=f"{route} executor step {index}",
@@ -5125,7 +5277,7 @@ def invoke_executor_with_route(state: RouterState, route: Literal["PRO", "FLASH"
         model_name,
         route_fallback_models(state, route),
         build_execution_prompt(state, route),
-        timeout=DEFAULT_PRO_EXECUTION_TIMEOUT if route == PRO else DEFAULT_FLASH_EXECUTION_TIMEOUT,
+        timeout=resolve_executor_timeout(route),
         num_predict=450 if route == PRO else 240,
         temperature=0.0,
         label=f"{route} executor step {state['current_step'] + 1}",
@@ -6062,23 +6214,30 @@ def run_router_app(
     )
     if resolved_max_concurrency == 1 and is_large_model(initial_state["judge_model"]):
         print("[LangGraph Config] Large Judge model detected; max_concurrency=1 to avoid local model contention.")
-    with token_usage_tracking_context(initial_state["run_id"]):
-        with langsmith_tracing_context(initial_state):
-            if not stream:
-                return graph.invoke(
+    run_timeout = resolve_non_negative_int(
+        None,
+        ROUTER_RUN_TIMEOUT_ENV_VAR,
+        DEFAULT_ROUTER_RUN_TIMEOUT,
+    )
+    with router_run_deadline_context(run_timeout):
+        with token_usage_tracking_context(initial_state["run_id"]):
+            with langsmith_tracing_context(initial_state):
+                if not stream:
+                    return graph.invoke(
+                        initial_state,
+                        config=graph_config,
+                    )
+
+                print("\n[LangGraph Stream] 🔄 节点级流式输出已启用。")
+                final_state: RouterState = initial_state
+                for event in graph.stream(
                     initial_state,
                     config=graph_config,
-                )
-
-            print("\n[LangGraph Stream] 🔄 节点级流式输出已启用。")
-            final_state: RouterState = initial_state
-            for event in graph.stream(
-                initial_state,
-                config=graph_config,
-                stream_mode=["updates", "values"],
-            ):
-                final_state = observe_stream_event(event, final_state=final_state)
-            return final_state
+                    stream_mode=["updates", "values"],
+                ):
+                    final_state = observe_stream_event(event, final_state=final_state)
+                    check_run_deadline()
+                return final_state
 
 
 def parse_cli_args(argv: List[str]) -> argparse.Namespace:

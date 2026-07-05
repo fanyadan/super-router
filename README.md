@@ -442,17 +442,25 @@ standalone, export them in your shell.
 | `ROUTER_PRO_FALLBACK_MODELS` | unset | Comma-separated PRO provider fallback list. |
 | `ROUTER_FLASH_FALLBACK_MODELS` | unset | Comma-separated FLASH provider fallback list. |
 | `ROUTER_FLASH_RETRY_BUDGET` | `1` | Number of FLASH retries for transient or unknown failures before recording failure. |
+| `ROUTER_MAX_PROVIDER_ATTEMPTS` | `3` | Maximum provider candidates tried per model call, including the primary model. |
 | `ROUTER_SKIP_WARMUP` | false | Skip planner and judge warmup pings when set to `1`, `true`, or `yes`. |
 | `ROUTER_RECURSION_LIMIT` | `128` | LangGraph recursion limit for the main graph. |
+| `ROUTER_RUN_TIMEOUT` | `7200` | Whole-run deadline in seconds. Set `0` to disable. |
 | `ROUTER_MAX_CONCURRENCY` | auto | Max concurrent LangGraph branches. Auto resolves to `1` for large judge models and otherwise leaves LangGraph default behavior. |
+| `ROUTER_WARMUP_TIMEOUT` | `60` | Timeout in seconds for planner and judge warmup pings. |
+| `ROUTER_PLANNER_TIMEOUT` | `300` | Timeout in seconds for planner task decomposition. |
 | `ROUTER_PLANNER_TASK_CHAR_LIMIT` | `6000` | Character budget for the compact planner context manifest. |
 | `ROUTER_PLANNER_MAX_OUTPUT_TOKENS` | `4096` | Planner JSON output token cap. |
 | `ROUTER_JUDGE_CONTEXT_CHAR_LIMIT` | `3000` | Character budget for judge context JSON. |
 | `ROUTER_EXECUTOR_CONTEXT_CHAR_LIMIT` | `8000` | Character budget for executor context JSON. |
+| `ROUTER_EXECUTOR_TIMEOUT` | `300` | Shared executor timeout in seconds for PRO and FLASH branches. |
+| `ROUTER_PRO_EXECUTOR_TIMEOUT` | `ROUTER_EXECUTOR_TIMEOUT` | PRO-specific executor timeout override. |
+| `ROUTER_FLASH_EXECUTOR_TIMEOUT` | `ROUTER_EXECUTOR_TIMEOUT` | FLASH-specific executor timeout override. |
 | `ROUTER_METADATA_OUTPUT_CHAR_LIMIT` | `6000` | Character budget for metadata extraction context and output excerpts. |
+| `ROUTER_METADATA_TIMEOUT` | `120` | Timeout in seconds for technical metadata extraction. |
 | `ROUTER_FINALIZER_CONTEXT_CHAR_LIMIT` | `12000` | Character budget for finalizer context JSON. |
 | `ROUTER_JUDGE_TIMEOUT` | `6000` for large judge models, otherwise `300` | Timeout in seconds for dependency judge and complexity judge calls. |
-| `ROUTER_FINALIZER_TIMEOUT` | `6000` | Timeout in seconds for FLASH and PRO finalizer calls. |
+| `ROUTER_FINALIZER_TIMEOUT` | `300` | Timeout in seconds for FLASH and PRO finalizer calls. |
 | `ROUTER_OLLAMA_URL` | `http://localhost:11434/api/generate` | Ollama generate endpoint. |
 | `ROUTER_CODEX_CLI` | first `codex` on `PATH`, else `codex` | Codex CLI executable path. |
 | `ROUTER_CODEX_CWD` | unset | Optional working directory passed to `codex exec --cd`. |
@@ -460,12 +468,13 @@ standalone, export them in your shell.
 | `ROUTER_GEMINI_CLI` | first `gemini` on `PATH`, else `/opt/homebrew/bin/gemini` | Gemini CLI executable path. |
 | `GEMINI_CLI_SYSTEM_SETTINGS_PATH` | platform default | Optional base Gemini CLI settings file. The router writes a temporary settings override per call to force temperature. |
 | `ROUTER_CLAUDE_CLI` | first `claude` on `PATH`, else `claude` | Claude Code CLI executable path. |
+| `ROUTER_PROVIDER_TERMINATION_GRACE` | `5` | Seconds to wait after SIGTERM before SIGKILL when a provider CLI times out. |
 | `ROUTER_DEBUG` | false | Print raw planner, judge, and provider diagnostic snippets when set to `1`, `true`, `yes`, `on`, or `debug`. |
 | `ROUTER_TOKEN_USAGE_LEDGER` | unset | Optional append-only JSONL path for per-call token usage records. |
 
-The code-level PRO executor, FLASH executor, and finalizer defaults are
-conservative (`6000` seconds) for long-running model workflows. External shell,
-terminal, or process supervisors can still stop the process earlier.
+Provider CLIs are launched in their own process group. On timeout, the router
+sends SIGTERM to the group, waits `ROUTER_PROVIDER_TERMINATION_GRACE` seconds,
+then sends SIGKILL if needed.
 
 Unset judge, executor, metadata, and finalizer context limits are doubled for
 high-risk tasks. Explicit environment values are used as-is.
