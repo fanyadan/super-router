@@ -256,7 +256,8 @@ The Judge scores each subtask on:
 |-----------|-------|
 | `complexity_score >= 5` | PRO |
 | `complexity_score <= 2` | FLASH |
-| Summary-like task (no deep work) | FLASH |
+| Concise stakeholder summary/status task (no deep work) | FLASH |
+| Cross-step synthesis, final report, or comparison of executor findings | PRO |
 | High-risk incident diagnosis | PRO |
 | High-risk evidence gathering | PRO |
 | High-risk decision/rollback evaluation | PRO |
@@ -267,7 +268,8 @@ The Judge scores each subtask on:
 The router applies automatic adjustments:
 - **High-risk context** (production, billing, security): boosts `reasoning_depth`, `risk`, `ambiguity`
 - **Evidence gathering** in incident: keeps on PRO (not mere IO)
-- **Communication/summary** subtasks: routed to FLASH unless deep work is also required
+- **Communication/status** subtasks: routed to FLASH unless deep work is also required
+- **Synthesis/comparison** subtasks: routed to PRO when they combine findings from other executor steps
 
 ## FLASH Review & Escalation Logic
 

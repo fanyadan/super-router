@@ -299,7 +299,8 @@ Routing guards then adjust or override the model suggestion:
 
 | Condition | Route |
 | --- | --- |
-| Summary, report, recap, or status update with no deep-work language | FLASH |
+| Concise stakeholder summary, recap, or status update with no deep-work language | FLASH |
+| Final synthesis, final report, comparison, or consolidation across executor findings | PRO |
 | Diagnostic investigation, debugging, fixing, implementation, migration, refactor, or design work | PRO |
 | High-risk operational, financial, security, rollback, containment, or incident work | PRO |
 | High-risk evidence gathering that supports diagnosis or decision-making | PRO |
@@ -327,7 +328,8 @@ Execution is wave-based:
 
 Executor prompts include only direct dependency results for the active subtask.
 This keeps comparison, synthesis, and reporting steps from running before the
-evidence-producing branches they depend on.
+evidence-producing branches they depend on. Cross-step synthesis and comparison
+subtasks are also biased to PRO so the final merge uses the stronger executor.
 
 If no subtask is ready while work remains, `dependency_deadlock` records
 fallback results for blocked subtasks, adds errors, and allows the finalizer to

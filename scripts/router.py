@@ -103,6 +103,34 @@ DEFERRED_EXECUTION_KEYWORDS = (
     "对比表",
     "比较表",
 )
+SYNTHESIS_ROUTE_KEYWORDS = (
+    "synthesize",
+    "synthesis",
+    "consolidate",
+    "combined findings",
+    "combine findings",
+    "compare findings",
+    "final comparison",
+    "comparison table",
+    "final table",
+    "final answer",
+    "final report",
+    "final summary",
+    "final synthesis",
+    "overall report",
+    "overall summary",
+    "all findings",
+    "across all",
+    "across steps",
+    "other steps",
+    "previous steps",
+    "prior results",
+    "综合",
+    "整合",
+    "最终",
+    "对比表",
+    "比较表",
+)
 COMMUNICATION_AUDIENCE_KEYWORDS = (
     "产品经理",
     "项目负责人",
@@ -1715,6 +1743,10 @@ def is_summary_like_subtask(description: str) -> bool:
     return contains_any(description.lower(), SUMMARY_ROUTE_KEYWORDS)
 
 
+def is_synthesis_like_subtask(description: str) -> bool:
+    return contains_any(description.lower(), SYNTHESIS_ROUTE_KEYWORDS)
+
+
 def is_deferred_execution_subtask(subtask: Subtask) -> bool:
     description = subtask["desc"]
     lowered = description.lower()
@@ -1771,6 +1803,9 @@ def apply_contextual_score_biases(
         adjusted["risk"] = max(adjusted["risk"], 2)
         if is_high_risk_evidence_step(description):
             adjusted["io_heaviness"] = min(adjusted["io_heaviness"], 1)
+    if is_synthesis_like_subtask(description):
+        adjusted["reasoning_depth"] = max(adjusted["reasoning_depth"], 2)
+        adjusted["ambiguity"] = max(adjusted["ambiguity"], 1)
     return adjusted
 
 
@@ -2183,9 +2218,12 @@ def decide_route(
 ) -> Literal["PRO", "FLASH"]:
     complexity_score = score_complexity(scores)
     summary_like = is_summary_like_subtask(description)
+    synthesis_like = is_synthesis_like_subtask(description)
     deep_work_hint = has_deep_work_hint(description)
     high_risk_core_step = is_high_risk_core_step(task, description)
 
+    if synthesis_like:
+        return PRO
     if summary_like and not deep_work_hint:
         return FLASH
     if summary_like and not deep_work_hint and scores["io_heaviness"] >= 1 and scores["code_change_scope"] <= 1 and scores["risk"] <= 1:
@@ -4013,7 +4051,8 @@ def build_judge_prompt(task: str, subtask_desc: str) -> str:
         "- ambiguity: 0-2 (0 = clear, 1 = some interpretation needed, 2 = unclear/open-ended)\n"
         "- risk: 0-2 (0 = low risk, 1 = moderate impact, 2 = high-risk or hard-to-reverse)\n"
         "- io_heaviness: 0-2 (0 = little IO/reporting, 1 = some read/write/reporting, 2 = mostly IO/reporting/formatting)\n"
-        "If the subtask is primarily summarizing findings, preparing a team update, writing a concise report, or formatting final output, prefer reasoning_depth <= 1, code_change_scope = 0, and suggested_route = FLASH unless the subtask explicitly says to debug, fix, implement, or investigate.\n"
+        "If the subtask is primarily preparing a team update, writing a concise stakeholder note, or formatting output, prefer reasoning_depth <= 1, code_change_scope = 0, and suggested_route = FLASH unless the subtask explicitly says to debug, fix, implement, or investigate.\n"
+        "If the subtask synthesizes, consolidates, compares, or writes a final report/answer from findings produced by other steps, score reasoning_depth >= 2 and suggested_route = PRO even if it sounds like summarization.\n"
         "Diagnostic evidence gathering such as inspecting logs, checking failing paths, comparing config changes, or isolating a root cause should still lean PRO even if it mostly reads files.\n"
         "If the original task is a billing/payment/finance/security/production incident, then evidence gathering, stop-loss or rollback evaluation, and containment decisions should usually score reasoning_depth >= 2, risk = 2, and suggested_route = PRO even when the step mostly reads logs or data.\n"
         "Also provide:\n"
@@ -4060,6 +4099,7 @@ def normalize_complexity_assessment(raw: Dict[str, Any], task: str, desc: str) -
         default=PRO,
     )
     summary_like = is_summary_like_subtask(desc)
+    synthesis_like = is_synthesis_like_subtask(desc)
     deep_work_hint = has_deep_work_hint(desc)
     high_risk_core_step = is_high_risk_core_step(task, desc)
     reason = compact_text(
@@ -4069,7 +4109,13 @@ def normalize_complexity_assessment(raw: Dict[str, Any], task: str, desc: str) -
     complexity_score = score_complexity(scores)
     final_route = decide_route(task, desc, scores, suggested_route, confidence)
     judge_source = "structured_llm"
-    if (
+    if synthesis_like and final_route == PRO:
+        reason = compact_text(
+            "Synthesis/comparison subtask kept on PRO because it must combine information from other executor steps.",
+            220,
+        )
+        judge_source = "structured_llm+synthesis_bias"
+    elif (
         summary_like
         and not deep_work_hint
         and final_route == FLASH
@@ -4106,6 +4152,7 @@ def normalize_complexity_assessment(raw: Dict[str, Any], task: str, desc: str) -
 def build_fallback_assessment(task: str, desc: str) -> ComplexityAssessment:
     text = desc.lower()
     summary_like = is_summary_like_subtask(desc)
+    synthesis_like = is_synthesis_like_subtask(desc)
     deep_work_hint = has_deep_work_hint(desc)
     reasoning_depth = 0
     code_change_scope = 0
@@ -4310,7 +4357,10 @@ def build_fallback_assessment(task: str, desc: str) -> ComplexityAssessment:
     confidence = 0.55 if (complexity_score > 0 or io_heaviness > 0) else 0.45
     final_route = decide_route(task, desc, scores, suggested_route, confidence)
     judge_source = "heuristic_fallback"
-    if summary_like and not deep_work_hint and final_route == FLASH:
+    if synthesis_like and final_route == PRO:
+        reason = "启发式规则将该子任务视为跨步骤综合/对比步骤，因此优先走 PRO。"
+        judge_source = "heuristic_fallback+synthesis_bias"
+    elif summary_like and not deep_work_hint and final_route == FLASH:
         reason = "启发式规则将该子任务视为独立的总结/状态更新步骤，优先走 FLASH。"
         judge_source = "heuristic_fallback+summary_bias"
     elif is_high_risk_core_step(task, desc) and final_route == PRO:

@@ -490,6 +490,38 @@ class RouterHelperTests(unittest.TestCase):
         self.assertEqual(high_risk["final_route"], r.PRO)
         self.assertEqual(high_risk["scores"]["risk"], 2)
 
+    def test_final_synthesis_routes_to_pro_despite_flash_judge_suggestion(self):
+        task = "Analyze provider A and provider B, then synthesize the final report."
+        desc = "Synthesize the final report from all provider findings and prior results."
+        low_summary_scores = {
+            "reasoning_depth": 0,
+            "code_change_scope": 0,
+            "ambiguity": 0,
+            "risk": 0,
+            "io_heaviness": 2,
+        }
+
+        self.assertTrue(r.is_synthesis_like_subtask(desc))
+        self.assertEqual(
+            r.decide_route(task, desc, low_summary_scores, r.FLASH, 0.95),
+            r.PRO,
+        )
+
+        assessment = r.normalize_complexity_assessment(
+            {
+                "scores": low_summary_scores,
+                "suggested_route": r.FLASH,
+                "confidence": 0.95,
+                "reason": "Looks like summarization.",
+            },
+            task,
+            desc,
+        )
+
+        self.assertEqual(assessment["final_route"], r.PRO)
+        self.assertEqual(assessment["judge_source"], "structured_llm+synthesis_bias")
+        self.assertGreaterEqual(assessment["scores"]["reasoning_depth"], 2)
+
     def test_generate_text_honors_gemini_timeout_and_temperature(self):
         captured = []
 
