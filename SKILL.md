@@ -21,7 +21,7 @@ Use super-router when you need:
 - **Task decomposition** — break complex tasks into structured subtasks with independent routing
 - **Cost optimization** — use fast models for simple work, heavy models only when needed
 - **Configurable models** — use deterministic defaults, with environment-variable overrides for each role
-- **Failure escalation** — FLASH retry on infra failures, escalate to PRO on capability failures
+- **Failure escalation** — FLASH retries transient infra failures within budget, then escalates to PRO; capability failures escalate to PRO immediately
 - **Audit trail** — full logging of planned vs actual routes, retries, and failure classifications
 
 **Not needed for:** Simple single-turn tasks, tasks where you already know which model to use, or when you want manual control over every routing decision.
@@ -280,9 +280,9 @@ When FLASH execution fails or produces questionable output:
    - `capability_quality`: "need more info", empty output, too short, repeated task
 
 2. **Decision:**
-   - Infra failure -> Retry FLASH (up to `ROUTER_FLASH_RETRY_BUDGET`)
+   - Infra failure -> Retry FLASH up to `ROUTER_FLASH_RETRY_BUDGET`; if the budget is exhausted, escalate the same step to PRO instead of recording `flash_retry_exhausted`
    - Capability failure -> Escalate to PRO immediately
-   - Unknown -> Retry once, then escalate
+   - Unknown -> Retry once, then escalate to PRO if still failing
 
 3. **Post-execution verification:**
    - Empty output -> escalate

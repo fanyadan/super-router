@@ -5039,15 +5039,34 @@ def execute_subtask_in_parallel_branch(
                     attempt_log.append(message)
                     continue
 
+                exhausted_action = (
+                    "escalating to PRO"
+                    if not escalated_from_flash
+                    else "recording exhausted FLASH result"
+                )
                 exhausted_reason = (
                     f"{review['reason']} Retry budget exhausted after {retry_count} retr"
-                    f"{'y' if retry_count == 1 else 'ies'}."
+                    f"{'y' if retry_count == 1 else 'ies'}; {exhausted_action}."
                 )
                 flash_review = {
-                    "decision": "record",
+                    "decision": "escalate" if not escalated_from_flash else "record",
                     "failure_type": review["failure_type"],
                     "reason": exhausted_reason,
                 }
+                if not escalated_from_flash:
+                    escalated_from_flash = True
+                    route = PRO
+                    model_name = state["pro_model"]
+                    status = "escalated_to_pro"
+                    message = (
+                        f"FLASH retry budget exhausted for step {index} "
+                        f"after {retry_count} retr{'y' if retry_count == 1 else 'ies'}; "
+                        f"escalating to PRO because {review['failure_type']}: {review['reason']}"
+                    )
+                    print(f"\n[Node: Parallel Retry Guard] 🧠 {message}")
+                    attempt_log.append(message)
+                    continue
+
                 if not output or output.startswith("FLASH executor fallback output:"):
                     output = (
                         f"FLASH execution failed after {retry_count} retr"
@@ -5457,7 +5476,7 @@ def route_after_flash_review(state: RouterState) -> str:
     return "recorder"
 
 
-def retry_guard_node(state: RouterState) -> RouterState:
+def retry_guard_node(state: RouterState) -> Dict[str, Any]:
     review = state["active_flash_review"]
     retries_used = state["active_retry_count"]
     retry_budget = state["flash_retry_budget"]
@@ -5480,36 +5499,30 @@ def retry_guard_node(state: RouterState) -> RouterState:
 
     exhausted_reason = (
         f"{review['reason']} Retry budget exhausted after {retries_used} retr"
-        f"{'y' if retries_used == 1 else 'ies'}."
+        f"{'y' if retries_used == 1 else 'ies'}; escalating to PRO."
     )
     print(
-        "\n[Node: Retry Guard] ⛔ FLASH retry budget exhausted，记录当前步骤失败并继续后续流程。"
+        "\n[Node: Retry Guard] 🧠 FLASH retry budget exhausted，升级到 PRO 执行当前步骤。"
     )
     attempt_log.append(exhausted_reason)
-    review = {
-        "decision": "record",
+    review: FlashReviewResult = {
+        "decision": "escalate",
         "failure_type": review["failure_type"],
         "reason": exhausted_reason,
     }
-    output = state["active_output"].strip()
-    if not output or output.startswith("FLASH executor fallback output:"):
-        output = (
-            f"FLASH execution failed after {retries_used} retr"
-            f"{'y' if retries_used == 1 else 'ies'} "
-            f"({review['failure_type']}): {review['reason']}"
-        )
     return {
-        "active_output": output,
         "active_flash_review": review,
         "active_attempt_log": attempt_log,
-        "history": [f"FLASH retry budget exhausted on step {state['current_step'] + 1}; recording failure."],
-        "status": "flash_retry_exhausted",
+        "history": [f"FLASH retry budget exhausted on step {state['current_step'] + 1}; escalating to PRO."],
+        "status": "flash_needs_escalation",
     }
 
 
 def route_after_retry_guard(state: RouterState) -> str:
     if state["status"] == "flash_retrying":
         return "retry_flash"
+    if state["status"] == "flash_needs_escalation":
+        return "escalation"
     return "recorder"
 
 

@@ -1114,6 +1114,30 @@ class ProviderFallbackTests(unittest.TestCase):
 
 
 class FlashReviewAndMetadataTests(unittest.TestCase):
+    def make_flash_subtask(self):
+        return {
+            "id": "S1",
+            "desc": "Inspect source-analysis inputs",
+            "depends_on": [],
+            "dependency_reason": "Independent.",
+            "model": r.FLASH,
+            "assessment": {
+                "scores": {
+                    "reasoning_depth": 1,
+                    "code_change_scope": 0,
+                    "ambiguity": 0,
+                    "risk": 0,
+                    "io_heaviness": 2,
+                },
+                "complexity_score": 1,
+                "suggested_route": r.FLASH,
+                "final_route": r.FLASH,
+                "confidence": 0.95,
+                "reason": "Simple inspection.",
+                "judge_source": "test",
+            },
+        }
+
     def test_flash_output_review_and_retry_guard(self):
         self.assertEqual(
             r.verify_flash_output("Inspect config", "", r.empty_flash_review(), 0)["decision"],
@@ -1146,8 +1170,116 @@ class FlashReviewAndMetadataTests(unittest.TestCase):
 
         state.update(retry_update)
         exhausted_update = r.retry_guard_node(state)
-        self.assertEqual(exhausted_update["status"], "flash_retry_exhausted")
-        self.assertIn("FLASH execution failed", exhausted_update["active_output"])
+        self.assertEqual(exhausted_update["status"], "flash_needs_escalation")
+        self.assertEqual(exhausted_update["active_flash_review"]["decision"], "escalate")
+        self.assertIn("Retry budget exhausted", exhausted_update["active_flash_review"]["reason"])
+        self.assertEqual(r.route_after_retry_guard(exhausted_update), "escalation")
+
+    def test_parallel_flash_retry_exhaustion_escalates_to_pro_success(self):
+        calls = []
+        pro_prompts = []
+        state = r.create_initial_state(
+            "retry exhaustion",
+            pro_model="pro",
+            flash_model="flash",
+            flash_retry_budget=1,
+        )
+        subtask = self.make_flash_subtask()
+        state["subtasks"] = [subtask]
+
+        def fake_invoke(primary_model, fallback_models, prompt, *, timeout, num_predict, temperature, label, attempt_log=None):
+            calls.append(primary_model)
+            if primary_model == "flash":
+                return {
+                    "success": False,
+                    "output": "",
+                    "model_name": primary_model,
+                    "used_provider_fallback": False,
+                    "failure_type": "infra_transient",
+                    "error_text": "connection reset by provider",
+                    "attempt_log": list(attempt_log or []),
+                }
+            pro_prompts.append(prompt)
+            return {
+                "success": True,
+                "output": "PRO completed the source-analysis step after FLASH retry exhaustion.",
+                "model_name": primary_model,
+                "used_provider_fallback": False,
+                "failure_type": "none",
+                "error_text": "",
+                "attempt_log": list(attempt_log or []),
+            }
+
+        with mock.patch.object(r, "invoke_with_provider_fallback", side_effect=fake_invoke):
+            (result, errors), output = run_quietly(
+                r.execute_subtask_in_parallel_branch,
+                state,
+                1,
+                subtask,
+            )
+
+        self.assertEqual(calls, ["flash", "flash", "pro"])
+        self.assertEqual(errors, [])
+        self.assertEqual(result["route"], r.PRO)
+        self.assertEqual(result["status"], "executed")
+        self.assertTrue(result["escalated_from_flash"])
+        self.assertEqual(result["retry_count"], 1)
+        self.assertEqual(result["flash_review"]["decision"], "escalate")
+        self.assertEqual(result["flash_review"]["failure_type"], "infra_transient")
+        self.assertIn("Retry budget exhausted", result["flash_review"]["reason"])
+        self.assertIn("escalating to PRO", result["flash_review"]["reason"])
+        self.assertIn("FLASH retry budget exhausted", " ".join(result["attempt_log"]))
+        self.assertIn("FLASH retry budget exhausted", output)
+        self.assertIn("Escalation context", pro_prompts[0])
+
+    def test_parallel_pro_failure_after_flash_retry_exhaustion_uses_executor_fallback(self):
+        calls = []
+        state = r.create_initial_state(
+            "retry exhaustion fallback",
+            pro_model="pro",
+            flash_model="flash",
+            flash_retry_budget=1,
+        )
+        subtask = self.make_flash_subtask()
+        state["subtasks"] = [subtask]
+
+        def fake_invoke(primary_model, fallback_models, prompt, *, timeout, num_predict, temperature, label, attempt_log=None):
+            calls.append(primary_model)
+            if primary_model == "flash":
+                return {
+                    "success": False,
+                    "output": "",
+                    "model_name": primary_model,
+                    "used_provider_fallback": False,
+                    "failure_type": "infra_transient",
+                    "error_text": "connection reset by provider",
+                    "attempt_log": list(attempt_log or []),
+                }
+            return {
+                "success": False,
+                "output": "",
+                "model_name": primary_model,
+                "used_provider_fallback": False,
+                "failure_type": "infra_transient",
+                "error_text": "PRO executor timed out",
+                "attempt_log": list(attempt_log or []),
+            }
+
+        with mock.patch.object(r, "invoke_with_provider_fallback", side_effect=fake_invoke):
+            (result, errors), _ = run_quietly(
+                r.execute_subtask_in_parallel_branch,
+                state,
+                1,
+                subtask,
+            )
+
+        self.assertEqual(calls, ["flash", "flash", "pro"])
+        self.assertEqual(result["route"], r.PRO)
+        self.assertEqual(result["status"], "executor_fallback")
+        self.assertNotEqual(result["status"], "flash_retry_exhausted")
+        self.assertTrue(result["escalated_from_flash"])
+        self.assertIn("PRO executor fallback on step 1", errors[0])
+        self.assertIn("Retry budget exhausted", result["flash_review"]["reason"])
 
     def test_metadata_extraction_uses_recorded_provider_fallback_result(self):
         state = r.create_initial_state("metadata", pro_model="pro")
