@@ -419,6 +419,33 @@ The router invokes Codex with `codex exec`, `--ephemeral`,
 intentionally does not pass `--ask-for-approval`, because some `codex exec`
 versions do not support that option.
 
+Claude-specific settings:
+
+```bash
+export ROUTER_MODEL=claude/sonnet
+export ROUTER_CLAUDE_CWD=/path/to/worktree
+export ROUTER_CLAUDE_SANDBOX=workspace-write
+```
+
+Claude Code separates permission modes from sandbox isolation. For Codex-style
+values, the router configures both where applicable:
+
+- `read-only`: passes `--permission-mode plan` plus temporary sandbox settings
+  that enable the Bash sandbox, fail closed if unavailable, disable unsandboxed
+  fallback, and deny writes to the workspace.
+- `workspace-write`: passes `--permission-mode acceptEdits` plus temporary
+  sandbox settings that enable the Bash sandbox, fail closed if unavailable,
+  auto-allow sandboxed Bash, and disable unsandboxed fallback. Claude's default
+  Bash sandbox permits writes to the working directory and session temp
+  directory.
+- `danger-full-access`: passes `--permission-mode bypassPermissions` without
+  sandbox settings.
+
+Native Claude permission modes (`acceptEdits`, `auto`, `bypassPermissions`,
+`manual`, `dontAsk`, `plan`) are also accepted directly and do not enable the
+Bash sandbox. When unset, the router leaves Claude's default permission mode and
+sandbox settings unchanged.
+
 For local large models, prefer a strong planner and a smaller judge, and
 serialize fanout:
 
@@ -470,6 +497,8 @@ standalone, export them in your shell.
 | `ROUTER_GEMINI_CLI` | first `gemini` on `PATH`, else `/opt/homebrew/bin/gemini` | Gemini CLI executable path. |
 | `GEMINI_CLI_SYSTEM_SETTINGS_PATH` | platform default | Optional base Gemini CLI settings file. The router writes a temporary settings override per call to force temperature. |
 | `ROUTER_CLAUDE_CLI` | first `claude` on `PATH`, else `claude` | Claude Code CLI executable path. |
+| `ROUTER_CLAUDE_CWD` | unset | Optional working directory for Claude Code CLI calls. This is the workspace used by Claude permission and sandbox settings. |
+| `ROUTER_CLAUDE_SANDBOX` | unset | Optional Claude sandbox/permission mapping. Codex-style `read-only` and `workspace-write` enable Claude Bash sandbox settings; `danger-full-access` and native Claude permission modes only set `--permission-mode`. |
 | `ROUTER_PROVIDER_TERMINATION_GRACE` | `5` | Seconds to wait after SIGTERM before SIGKILL when a provider CLI times out. |
 | `ROUTER_DEBUG` | false | Print raw planner, judge, and provider diagnostic snippets when set to `1`, `true`, `yes`, `on`, or `debug`. |
 | `ROUTER_TOKEN_USAGE_LEDGER` | unset | Optional append-only JSONL path for per-call token usage records. |

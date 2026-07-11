@@ -44,6 +44,8 @@ ROUTER_CODEX_CWD_ENV_VAR = "ROUTER_CODEX_CWD"
 ROUTER_CODEX_SANDBOX_ENV_VAR = "ROUTER_CODEX_SANDBOX"
 GEMINI_CLI_PATH = os.environ.get("ROUTER_GEMINI_CLI", shutil.which("gemini") or "/opt/homebrew/bin/gemini")
 CLAUDE_CLI_PATH = os.environ.get("ROUTER_CLAUDE_CLI", shutil.which("claude") or "claude")
+ROUTER_CLAUDE_CWD_ENV_VAR = "ROUTER_CLAUDE_CWD"
+ROUTER_CLAUDE_SANDBOX_ENV_VAR = "ROUTER_CLAUDE_SANDBOX"
 GEMINI_SYSTEM_SETTINGS_ENV_VAR = "GEMINI_CLI_SYSTEM_SETTINGS_PATH"
 ROUTER_SKIP_WARMUP = os.environ.get("ROUTER_SKIP_WARMUP", "0").lower() in ("1", "true", "yes")
 ROUTER_LANGSMITH_ENABLED_ENV_VAR = "ROUTER_LANGSMITH_ENABLED"
@@ -834,6 +836,7 @@ def run_provider_cli(
     timeout: int,
     env: Dict[str, str],
     label: str,
+    cwd: str | None = None,
 ) -> subprocess.CompletedProcess:
     effective_timeout = timeout_with_run_deadline(timeout)
     grace_timeout = resolve_positive_int(
@@ -849,6 +852,8 @@ def run_provider_cli(
         "text": True,
         "env": env,
     }
+    if cwd:
+        popen_kwargs["cwd"] = cwd
     if os.name == "posix":
         popen_kwargs["start_new_session"] = True
     elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
@@ -3423,6 +3428,98 @@ def sum_optional_ints(values: List[Any]) -> int | None:
     return total if found else None
 
 
+CLAUDE_PERMISSION_MODE_BY_KEY = {
+    "acceptedits": "acceptEdits",
+    "auto": "auto",
+    "bypasspermissions": "bypassPermissions",
+    "manual": "manual",
+    "dontask": "dontAsk",
+    "plan": "plan",
+}
+
+CLAUDE_SANDBOX_PERMISSION_MODE_ALIASES = {
+    "read-only": "plan",
+    "readonly": "plan",
+    "workspace-write": "acceptEdits",
+    "workspace": "acceptEdits",
+    "danger-full-access": "bypassPermissions",
+    "full-access": "bypassPermissions",
+}
+
+CLAUDE_CODEX_STYLE_SANDBOX_BY_KEY = {
+    "read-only": "read-only",
+    "readonly": "read-only",
+    "workspace-write": "workspace-write",
+    "workspace": "workspace-write",
+    "danger-full-access": "danger-full-access",
+    "full-access": "danger-full-access",
+}
+
+
+def build_claude_sandbox_settings(codex_sandbox_mode: str) -> Dict[str, Any] | None:
+    if codex_sandbox_mode == "workspace-write":
+        return {
+            "sandbox": {
+                "enabled": True,
+                "failIfUnavailable": True,
+                "autoAllowBashIfSandboxed": True,
+                "allowUnsandboxedCommands": False,
+            }
+        }
+
+    if codex_sandbox_mode == "read-only":
+        return {
+            "sandbox": {
+                "enabled": True,
+                "failIfUnavailable": True,
+                "autoAllowBashIfSandboxed": False,
+                "allowUnsandboxedCommands": False,
+                "filesystem": {
+                    "denyWrite": ["."],
+                },
+            }
+        }
+
+    return None
+
+
+def normalize_claude_sandbox_config(value: str) -> tuple[str, Dict[str, Any] | None]:
+    raw = value.strip()
+    if not raw:
+        return "", None
+
+    direct_key = raw.replace("-", "").replace("_", "").lower()
+    if direct_key in CLAUDE_PERMISSION_MODE_BY_KEY:
+        return CLAUDE_PERMISSION_MODE_BY_KEY[direct_key], None
+
+    alias_key = raw.replace("_", "-").lower()
+    if alias_key in CLAUDE_CODEX_STYLE_SANDBOX_BY_KEY:
+        codex_sandbox_mode = CLAUDE_CODEX_STYLE_SANDBOX_BY_KEY[alias_key]
+        return CLAUDE_SANDBOX_PERMISSION_MODE_ALIASES[alias_key], build_claude_sandbox_settings(codex_sandbox_mode)
+
+    supported = ", ".join(
+        [
+            "read-only",
+            "workspace-write",
+            "danger-full-access",
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "manual",
+            "dontAsk",
+            "plan",
+        ]
+    )
+    raise RuntimeError(
+        f"Invalid {ROUTER_CLAUDE_SANDBOX_ENV_VAR}={value!r}. "
+        f"Use one of: {supported}."
+    )
+
+
+def normalize_claude_permission_mode(value: str) -> str:
+    return normalize_claude_sandbox_config(value)[0]
+
+
 def extract_claude_usage_metadata(parsed: Dict[str, Any], normalized_model: str) -> Dict[str, int]:
     usage = parsed.get("usage")
     if isinstance(usage, dict):
@@ -3515,13 +3612,23 @@ def claude_generate_with_usage(
 
     env = dict(os.environ)
     env["NO_COLOR"] = "1"
-    command = [CLAUDE_CLI_PATH, "--model", normalized_model, "--output-format", "json", "-p", prompt]
+    permission_mode, sandbox_settings = normalize_claude_sandbox_config(
+        os.environ.get(ROUTER_CLAUDE_SANDBOX_ENV_VAR, "")
+    )
+    command = [CLAUDE_CLI_PATH, "--model", normalized_model, "--output-format", "json"]
+    if permission_mode:
+        command.extend(["--permission-mode", permission_mode])
+    if sandbox_settings:
+        command.extend(["--settings", json.dumps(sandbox_settings, sort_keys=True, separators=(",", ":"))])
+    command.extend(["-p", prompt])
+    claude_cwd = os.environ.get(ROUTER_CLAUDE_CWD_ENV_VAR, "").strip()
 
     result = run_provider_cli(
         command,
         timeout=timeout,
         env=env,
         label=f"Claude CLI {normalized_model}",
+        cwd=claude_cwd or None,
     )
 
     stdout = result.stdout.strip()

@@ -139,6 +139,7 @@ For router runs that create or modify artifacts (reports, JSON logs, database in
 3. If stdout and artifacts disagree, treat the artifacts/logs as the source of truth and report the discrepancy immediately.
 4. If the discrepancy means the user requirement is not satisfied (for example, requested 20 items but artifact contains 33), do not claim success. Either launch a correction pass when permitted or state the exact blocker.
 5. For ingestion workflows, verify the saved ingest JSON fields (`status`, checked/accepted/skipped counts, threshold, document list) and ensure the user-facing Markdown/HTML item set matches the accepted ingested documents.
+6. For GUI/native app delivery, source files or a bundle scaffold are not enough. If build, packaging, executable checks, or smoke-test steps are `BLOCKED`, `FAILED`, or absent, report `Router failed: incomplete artifact` rather than claiming a runnable app. When the user requires "only through super-router", the only valid continuation is another router run scoped to build/debug/verification; do not complete the build outside the router. See `references/background-app-build-verification.md`.
 
 ## Environment Variables
 
@@ -170,6 +171,8 @@ All `ROUTER_*` variables are loaded from `~/.hermes/.env` by the Hermes runtime 
 | `ROUTER_CODEX_CWD` | Optional working directory passed to `codex exec --cd` | None |
 | `ROUTER_CODEX_SANDBOX` | Sandbox mode passed to `codex exec --sandbox` | `read-only` |
 | `ROUTER_CLAUDE_CLI` | Claude Code CLI executable path for Claude-backed model names | first `claude` on `PATH`, else `claude` |
+| `ROUTER_CLAUDE_CWD` | Optional working directory for Claude Code CLI calls. This is the workspace used by Claude permission and sandbox settings. | None |
+| `ROUTER_CLAUDE_SANDBOX` | Optional Claude sandbox/permission mapping. Codex-style `read-only` and `workspace-write` enable Claude Bash sandbox settings; `danger-full-access` and native Claude permission modes only set `--permission-mode`. | None |
 | `ROUTER_PROVIDER_TERMINATION_GRACE` | Seconds to wait after SIGTERM before SIGKILL for timed-out provider CLIs | 5 |
 | `ROUTER_FLASH_RETRY_BUDGET` | Max FLASH retries before escalation | 1 |
 | `ROUTER_RECURSION_LIMIT` | Python recursion limit | 128 |
@@ -196,6 +199,12 @@ Provider selection is model-name based:
   The router passes `--sandbox` but intentionally does not pass `--ask-for-approval`, because some `codex exec` versions do not support that option.
 - Gemini CLI: `google-gemini-cli/...`, `gemini-*`, `pro`, `flash`, `flash-lite`, or `auto`.
 - Claude Code CLI: `claude/...` or bare `claude-*` model names.
+  `ROUTER_CLAUDE_CWD` sets the provider process working directory.
+  Claude Code separates permission modes from sandbox isolation. For Codex-style values, the router configures both where applicable:
+  `read-only` -> `--permission-mode plan` plus temporary Bash sandbox settings that fail closed, disable unsandboxed fallback, and deny workspace writes;
+  `workspace-write` -> `--permission-mode acceptEdits` plus temporary Bash sandbox settings that fail closed, auto-allow sandboxed Bash, and disable unsandboxed fallback;
+  `danger-full-access` -> `--permission-mode bypassPermissions` without sandbox settings.
+  Native Claude permission modes (`acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`) are also accepted directly and do not enable the Bash sandbox.
 - Ollama: all other model names, or explicit `ollama/...`.
 
 ### LangSmith Telemetry
@@ -362,6 +371,7 @@ FLASH finalizer -> (if fails) -> PRO finalizer -> (if fails) -> Deterministic te
 | `SKILL.md` | This documentation |
 | `references/long-running-quantitative-tasks.md` | Guidance for heavy Monte Carlo / financial modeling tasks and background execution |
 | `references/background-artifact-launches.md` | Wrapper pattern for background router runs that produce durable artifacts: prompt/context capture, stream logs, verification, and safe handling of blocked launches |
+| `references/background-app-build-verification.md` | Pattern for background GUI/native app implementation runs: source scaffolding is not success unless build, clickable bundle, deterministic smoke mode, bundle metadata/executable/codesign checks, and smoke verification complete |
 | `references/source-html-background-wrapper.md` | Concrete pattern for source-tree-to-HTML hierarchy/explainer jobs: source JSON collector, compact router prompt, HTML generator from context+log, background launch, immediate poll, and artifact verification |
 | `references/linux-mm-source-html-example.md` | Session-specific exemplar for a large Linux `mm/` source hierarchy HTML guide: bucket taxonomy, artifact sections, and verification thresholds. Use as a model for similarly large kernel/subsystem explainers. |
 | `templates/source-html-background-wrapper.sh` | Copyable shell wrapper template for source-tree-to-HTML background jobs. Use it to avoid retyping the run/status/log/verification scaffold; replace placeholders and tune verification thresholds per artifact. |

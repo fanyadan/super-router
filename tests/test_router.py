@@ -645,15 +645,17 @@ class RouterHelperTests(unittest.TestCase):
             )
             stderr = ""
 
-        def fake_cli(command, *, input_text=None, timeout, env, label):
+        def fake_cli(command, *, input_text=None, timeout, env, label, cwd=None):
             captured["command"] = command
             captured["input_text"] = input_text
             captured["timeout"] = timeout
             captured["env"] = env
             captured["label"] = label
+            captured["cwd"] = cwd
             return FakeResult()
 
         with (
+            mock.patch.dict(os.environ, {"ROUTER_CLAUDE_SANDBOX": "", "ROUTER_CLAUDE_CWD": ""}, clear=False),
             mock.patch.object(r, "CLAUDE_CLI_PATH", "/tmp/claude"),
             mock.patch.object(r.os.path, "exists", return_value=True),
             mock.patch.object(r, "run_provider_cli", side_effect=fake_cli),
@@ -683,6 +685,95 @@ class RouterHelperTests(unittest.TestCase):
         self.assertEqual(captured["timeout"], 30)
         self.assertEqual(captured["env"]["NO_COLOR"], "1")
         self.assertEqual(captured["label"], "Claude CLI sonnet")
+        self.assertIsNone(captured["cwd"])
+
+    def test_claude_sandbox_workspace_write_uses_accept_edits_and_bash_sandbox(self):
+        captured = {}
+
+        class FakeResult:
+            returncode = 0
+            stdout = json.dumps({"result": "ok"})
+            stderr = ""
+
+        def fake_cli(command, *, input_text=None, timeout, env, label, cwd=None):
+            captured["command"] = command
+            captured["cwd"] = cwd
+            return FakeResult()
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "ROUTER_CLAUDE_SANDBOX": "workspace-write",
+                    "ROUTER_CLAUDE_CWD": "/tmp/claude-work",
+                },
+                clear=False,
+            ),
+            mock.patch.object(r, "CLAUDE_CLI_PATH", "/tmp/claude"),
+            mock.patch.object(r.os.path, "exists", return_value=True),
+            mock.patch.object(r, "run_provider_cli", side_effect=fake_cli),
+        ):
+            r.claude_generate_with_usage("claude/sonnet", "prompt", timeout=30)
+
+        self.assertEqual(
+            captured["command"],
+            [
+                "/tmp/claude",
+                "--model",
+                "sonnet",
+                "--output-format",
+                "json",
+                "--permission-mode",
+                "acceptEdits",
+                "--settings",
+                captured["command"][captured["command"].index("--settings") + 1],
+                "-p",
+                "prompt",
+            ],
+        )
+        self.assertEqual(
+            json.loads(captured["command"][captured["command"].index("--settings") + 1]),
+            {
+                "sandbox": {
+                    "enabled": True,
+                    "failIfUnavailable": True,
+                    "autoAllowBashIfSandboxed": True,
+                    "allowUnsandboxedCommands": False,
+                }
+            },
+        )
+        self.assertEqual(captured["cwd"], "/tmp/claude-work")
+
+    def test_claude_sandbox_read_only_uses_plan_and_denies_sandbox_writes(self):
+        permission_mode, settings = r.normalize_claude_sandbox_config("read-only")
+
+        self.assertEqual(permission_mode, "plan")
+        self.assertEqual(
+            settings,
+            {
+                "sandbox": {
+                    "enabled": True,
+                    "failIfUnavailable": True,
+                    "autoAllowBashIfSandboxed": False,
+                    "allowUnsandboxedCommands": False,
+                    "filesystem": {
+                        "denyWrite": ["."],
+                    },
+                }
+            },
+        )
+
+    def test_claude_sandbox_accepts_direct_permission_modes(self):
+        self.assertEqual(r.normalize_claude_permission_mode("acceptEdits"), "acceptEdits")
+        self.assertEqual(r.normalize_claude_permission_mode("dontAsk"), "dontAsk")
+        self.assertEqual(r.normalize_claude_permission_mode("bypassPermissions"), "bypassPermissions")
+        self.assertEqual(r.normalize_claude_permission_mode("read-only"), "plan")
+        self.assertEqual(r.normalize_claude_permission_mode("danger-full-access"), "bypassPermissions")
+        self.assertEqual(r.normalize_claude_sandbox_config("acceptEdits"), ("acceptEdits", None))
+
+    def test_claude_sandbox_rejects_unknown_permission_mode(self):
+        with self.assertRaisesRegex(RuntimeError, "ROUTER_CLAUDE_SANDBOX"):
+            r.normalize_claude_permission_mode("workspace-read-write")
 
     def test_extract_claude_usage_metadata_accepts_model_usage_and_legacy_fields(self):
         self.assertEqual(
