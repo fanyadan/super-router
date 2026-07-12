@@ -198,6 +198,25 @@ DEEP_WORK_HINT_KEYWORDS = (
     "设计",
     "逻辑",
 )
+DATA_GATHERING_HINT_KEYWORDS = (
+    # Prevent summary-keyword false positives when a subtask produces summaries
+    # as output fields rather than being a summary/status-update step.
+    "gather",
+    "collect",
+    "for each",
+    "research",
+    "compile",
+    "retrieve",
+    "fetch",
+    "extract",
+    "search",
+    "收集",
+    "采集",
+    "搜索",
+    "检索",
+    "提取",
+    "汇编",
+)
 HIGH_RISK_CONTEXT_KEYWORDS = (
     "incident",
     "outage",
@@ -1755,13 +1774,21 @@ def is_synthesis_like_subtask(description: str) -> bool:
 def is_deferred_execution_subtask(subtask: Subtask) -> bool:
     description = subtask["desc"]
     lowered = description.lower()
-    if is_summary_like_subtask(description) and not has_deep_work_hint(description):
+    if is_summary_like_subtask(description) and not has_non_summary_work_hint(description):
         return True
     return contains_any(lowered, DEFERRED_EXECUTION_KEYWORDS)
 
 
 def has_deep_work_hint(description: str) -> bool:
     return contains_any(description.lower(), DEEP_WORK_HINT_KEYWORDS)
+
+
+def has_data_gathering_hint(description: str) -> bool:
+    return contains_any(description.lower(), DATA_GATHERING_HINT_KEYWORDS)
+
+
+def has_non_summary_work_hint(description: str) -> bool:
+    return has_deep_work_hint(description) or has_data_gathering_hint(description)
 
 
 def is_high_risk_context(task: str, description: str) -> bool:
@@ -2167,7 +2194,7 @@ def default_communication_subtask(task: str) -> PlannedSubtask:
 
 def split_mixed_planned_subtask(description: str) -> List[PlannedSubtask]:
     match = find_communication_clause(description)
-    if not match or not has_deep_work_hint(description):
+    if not match or not has_non_summary_work_hint(description):
         return [{"desc": description}]
 
     clause_start, communication_clause = match
@@ -2225,13 +2252,12 @@ def decide_route(
     summary_like = is_summary_like_subtask(description)
     synthesis_like = is_synthesis_like_subtask(description)
     deep_work_hint = has_deep_work_hint(description)
+    data_gathering_hint = has_data_gathering_hint(description)
     high_risk_core_step = is_high_risk_core_step(task, description)
 
     if synthesis_like:
         return PRO
-    if summary_like and not deep_work_hint:
-        return FLASH
-    if summary_like and not deep_work_hint and scores["io_heaviness"] >= 1 and scores["code_change_scope"] <= 1 and scores["risk"] <= 1:
+    if summary_like and not deep_work_hint and not data_gathering_hint:
         return FLASH
     if high_risk_core_step:
         return PRO
@@ -4208,6 +4234,7 @@ def normalize_complexity_assessment(raw: Dict[str, Any], task: str, desc: str) -
     summary_like = is_summary_like_subtask(desc)
     synthesis_like = is_synthesis_like_subtask(desc)
     deep_work_hint = has_deep_work_hint(desc)
+    data_gathering_hint = has_data_gathering_hint(desc)
     high_risk_core_step = is_high_risk_core_step(task, desc)
     reason = compact_text(
         str(raw.get("reason") or raw.get("summary") or f"Structured complexity judgment for: {desc}"),
@@ -4225,11 +4252,12 @@ def normalize_complexity_assessment(raw: Dict[str, Any], task: str, desc: str) -
     elif (
         summary_like
         and not deep_work_hint
+        and not data_gathering_hint
         and final_route == FLASH
         and (suggested_route != FLASH or complexity_score > 3)
     ):
         reason = compact_text(
-            "Summary/status-update subtask judged in isolation; prefer FLASH despite the broader debugging context.",
+            "Subtask contains summary-like terms but scores as low-complexity data formatting or aggregation; routing to FLASH.",
             220,
         )
         judge_source = "structured_llm+summary_bias"
@@ -4261,6 +4289,7 @@ def build_fallback_assessment(task: str, desc: str) -> ComplexityAssessment:
     summary_like = is_summary_like_subtask(desc)
     synthesis_like = is_synthesis_like_subtask(desc)
     deep_work_hint = has_deep_work_hint(desc)
+    data_gathering_hint = has_data_gathering_hint(desc)
     reasoning_depth = 0
     code_change_scope = 0
     ambiguity = 0
@@ -4467,7 +4496,7 @@ def build_fallback_assessment(task: str, desc: str) -> ComplexityAssessment:
     if synthesis_like and final_route == PRO:
         reason = "启发式规则将该子任务视为跨步骤综合/对比步骤，因此优先走 PRO。"
         judge_source = "heuristic_fallback+synthesis_bias"
-    elif summary_like and not deep_work_hint and final_route == FLASH:
+    elif summary_like and not deep_work_hint and not data_gathering_hint and final_route == FLASH:
         reason = "启发式规则将该子任务视为独立的总结/状态更新步骤，优先走 FLASH。"
         judge_source = "heuristic_fallback+summary_bias"
     elif is_high_risk_core_step(task, desc) and final_route == PRO:

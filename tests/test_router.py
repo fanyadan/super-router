@@ -490,6 +490,59 @@ class RouterHelperTests(unittest.TestCase):
         self.assertEqual(high_risk["final_route"], r.PRO)
         self.assertEqual(high_risk["scores"]["risk"], 2)
 
+    def test_data_gathering_summary_fields_do_not_trigger_summary_or_high_risk_bias(self):
+        data_task = "Analyze service health inputs."
+        data_desc = "Collect summary, impact, and owner for each affected service."
+        raw_data_judgment = {
+            "scores": {
+                "reasoning_depth": 2,
+                "code_change_scope": 0,
+                "ambiguity": 1,
+                "risk": 0,
+                "io_heaviness": 2,
+            },
+            "suggested_route": r.PRO,
+            "confidence": 0.85,
+            "reason": "Requires per-service extraction and comparison.",
+        }
+
+        self.assertTrue(r.is_summary_like_subtask(data_desc))
+        self.assertTrue(r.has_data_gathering_hint(data_desc))
+        self.assertFalse(r.has_deep_work_hint(data_desc))
+        self.assertFalse(r.is_deferred_execution_subtask({"desc": data_desc}))
+
+        assessment = r.normalize_complexity_assessment(raw_data_judgment, data_task, data_desc)
+        self.assertEqual(assessment["final_route"], r.PRO)
+        self.assertEqual(assessment["judge_source"], "structured_llm")
+
+        high_risk_task = "Production payment incident."
+        status_search_desc = "Search status update notes from support channels."
+        raw_status_judgment = {
+            "scores": {
+                "reasoning_depth": 0,
+                "code_change_scope": 0,
+                "ambiguity": 0,
+                "risk": 0,
+                "io_heaviness": 2,
+            },
+            "suggested_route": r.PRO,
+            "confidence": 0.85,
+            "reason": "Only collecting existing notes.",
+        }
+
+        self.assertTrue(r.is_summary_like_subtask(status_search_desc))
+        self.assertTrue(r.has_data_gathering_hint(status_search_desc))
+        self.assertFalse(r.has_deep_work_hint(status_search_desc))
+        self.assertFalse(r.is_high_risk_core_step(high_risk_task, status_search_desc))
+
+        status_assessment = r.normalize_complexity_assessment(
+            raw_status_judgment,
+            high_risk_task,
+            status_search_desc,
+        )
+        self.assertEqual(status_assessment["final_route"], r.FLASH)
+        self.assertEqual(status_assessment["judge_source"], "structured_llm")
+
     def test_final_synthesis_routes_to_pro_despite_flash_judge_suggestion(self):
         task = "Analyze provider A and provider B, then synthesize the final report."
         desc = "Synthesize the final report from all provider findings and prior results."
