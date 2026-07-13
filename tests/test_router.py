@@ -543,6 +543,46 @@ class RouterHelperTests(unittest.TestCase):
         self.assertEqual(status_assessment["final_route"], r.FLASH)
         self.assertEqual(status_assessment["judge_source"], "structured_llm")
 
+    def test_keyword_matching_avoids_english_substring_false_positives(self):
+        self.assertFalse(r.contains_any("product catalog", ("prod",)))
+        self.assertFalse(r.contains_any("author records", ("auth",)))
+        self.assertTrue(r.contains_any("prod incident", ("prod",)))
+        self.assertTrue(r.contains_any("auth failure", ("auth",)))
+        self.assertTrue(r.contains_any("status-update", ("status update",)))
+        self.assertTrue(r.contains_any("api_endpoint", ("api endpoint",)))
+        self.assertTrue(r.contains_any("analysis report", ("analy",)))
+        self.assertTrue(r.contains_any("analyze logs", ("analy",)))
+        self.assertTrue(r.contains_any("请分析日志", ("分析",)))
+
+        raw_simple_judgment = {
+            "scores": {
+                "reasoning_depth": 0,
+                "code_change_scope": 0,
+                "ambiguity": 0,
+                "risk": 0,
+                "io_heaviness": 2,
+            },
+            "suggested_route": r.FLASH,
+            "confidence": 0.9,
+            "reason": "Simple record listing.",
+        }
+
+        author_assessment = r.normalize_complexity_assessment(
+            raw_simple_judgment,
+            "Review author profile metadata",
+            "List author records and missing biography fields",
+        )
+        self.assertEqual(author_assessment["final_route"], r.FLASH)
+        self.assertEqual(author_assessment["judge_source"], "structured_llm")
+
+        product_assessment = r.normalize_complexity_assessment(
+            raw_simple_judgment,
+            "Audit product catalog metadata",
+            "List product records and missing image fields",
+        )
+        self.assertEqual(product_assessment["final_route"], r.FLASH)
+        self.assertEqual(product_assessment["judge_source"], "structured_llm")
+
     def test_summary_route_bias_respects_complexity_threshold(self):
         task = "Prepare project communication notes."
         desc = "Prepare a concise summary report."

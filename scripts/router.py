@@ -58,6 +58,14 @@ FLASH = "FLASH"
 PRO_COMPLEXITY_THRESHOLD = 5
 FLASH_COMPLEXITY_THRESHOLD = 2
 LOW_CONFIDENCE_THRESHOLD = 0.35
+ENGLISH_PREFIX_MATCH_KEYWORDS = frozenset(
+    (
+        "analy",
+        "diagnos",
+        "investig",
+        "optimiz",
+    )
+)
 SUMMARY_ROUTE_KEYWORDS = (
     "summary",
     "summarize",
@@ -1772,8 +1780,26 @@ def clamp_float(value: Any, minimum: float, maximum: float, default: float = 0.5
     return max(minimum, min(maximum, parsed))
 
 
+def contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+
+def keyword_matches(text: str, keyword: str) -> bool:
+    normalized_keyword = keyword.lower().strip()
+    if not normalized_keyword:
+        return False
+    if contains_cjk(normalized_keyword):
+        return normalized_keyword in text
+
+    phrase_pattern = re.escape(normalized_keyword).replace(r"\ ", r"[\s_-]+")
+    if normalized_keyword in ENGLISH_PREFIX_MATCH_KEYWORDS:
+        phrase_pattern = f"{phrase_pattern}[a-z0-9_-]*"
+    return re.search(rf"(?<![a-z0-9]){phrase_pattern}(?![a-z0-9])", text) is not None
+
+
 def contains_any(text: str, keywords: tuple[str, ...]) -> bool:
-    return any(keyword in text for keyword in keywords)
+    lowered = text.lower()
+    return any(keyword_matches(lowered, keyword) for keyword in keywords)
 
 def is_summary_like_subtask(description: str) -> bool:
     return contains_any(description.lower(), SUMMARY_ROUTE_KEYWORDS)
