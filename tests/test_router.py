@@ -1143,14 +1143,90 @@ class RouterHelperTests(unittest.TestCase):
             return r.build_text_generation_result("ok", {}, "test", model, "unavailable")
 
         with r.router_run_deadline_context(5):
-            with mock.patch.object(r, "_execute_generate_text_with_usage", side_effect=fake_generate):
-                self.assertEqual(
-                    r.generate_text("ollama/test", "prompt", timeout=300, usage_label="deadline"),
-                    "ok",
-                )
+            with mock.patch.object(r, "langsmith_tracing_configured", return_value=False):
+                with mock.patch.object(r, "_execute_generate_text_with_usage", side_effect=fake_generate):
+                    self.assertEqual(
+                        r.generate_text("ollama/test", "prompt", timeout=300, usage_label="deadline"),
+                        "ok",
+                    )
 
         self.assertGreaterEqual(captured["timeout"], 1)
         self.assertLessEqual(captured["timeout"], 5)
+
+    def test_ollama_missing_model_falls_back_to_installed_model(self):
+        calls = []
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            request_payload = json.loads(request.data.decode("utf-8")) if request.data else None
+            calls.append((request.full_url, request_payload, timeout))
+            if len(calls) == 1:
+                raise r.urllib.error.HTTPError(
+                    request.full_url,
+                    404,
+                    "Not Found",
+                    {},
+                    io.BytesIO(b'{"error":"model \\"missing\\" not found"}'),
+                )
+            if request.full_url == r.ollama_api_endpoint("tags"):
+                return FakeResponse({"models": [{"name": "llama3.1:8b"}]})
+            return FakeResponse(
+                {
+                    "response": "fallback output",
+                    "prompt_eval_count": 2,
+                    "eval_count": 3,
+                }
+            )
+
+        with mock.patch.object(r.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = r.ollama_generate_with_usage("ollama/missing", "prompt", timeout=10)
+
+        self.assertEqual(result["text"], "fallback output")
+        self.assertEqual(result["model_name"], "llama3.1:8b")
+        self.assertEqual(calls[0][1]["model"], "missing")
+        self.assertEqual(calls[1][0], r.ollama_api_endpoint("tags"))
+        self.assertEqual(calls[2][1]["model"], "llama3.1:8b")
+        self.assertEqual(
+            result["usage_metadata"],
+            {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+        )
+
+    def test_ollama_prefixed_model_name_is_normalized(self):
+        captured = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps({"response": "ok"}).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        with mock.patch.object(r.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self.assertEqual(
+                r.ollama_generate_with_usage("ollama/llama3.1:8b", "prompt", timeout=1)["text"],
+                "ok",
+            )
+
+        self.assertEqual(captured["payload"]["model"], "llama3.1:8b")
 
     def test_executor_timeout_env_is_used(self):
         captured = {}
