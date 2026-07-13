@@ -161,7 +161,9 @@ DEEP_WORK_HINT_KEYWORDS = (
     "identify",
     "compare",
     "determine",
+    "discover",
     "isolate",
+    "locate",
     "review",
     "verify",
     "analy",
@@ -209,6 +211,16 @@ DATA_GATHERING_HINT_KEYWORDS = (
     "retrieve",
     "fetch",
     "extract",
+    "ingest",
+    "persist",
+    "database",
+    "connection method",
+    "api endpoint",
+    "file-based store",
+    "write",
+    "insert",
+    "upsert",
+    "records",
     "search",
     "收集",
     "采集",
@@ -2257,7 +2269,12 @@ def decide_route(
 
     if synthesis_like:
         return PRO
-    if summary_like and not deep_work_hint and not data_gathering_hint:
+    if (
+        summary_like
+        and not deep_work_hint
+        and not data_gathering_hint
+        and complexity_score < PRO_COMPLEXITY_THRESHOLD
+    ):
         return FLASH
     if high_risk_core_step:
         return PRO

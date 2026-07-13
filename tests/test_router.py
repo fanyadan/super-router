@@ -543,6 +543,72 @@ class RouterHelperTests(unittest.TestCase):
         self.assertEqual(status_assessment["final_route"], r.FLASH)
         self.assertEqual(status_assessment["judge_source"], "structured_llm")
 
+    def test_summary_route_bias_respects_complexity_threshold(self):
+        task = "Prepare project communication notes."
+        desc = "Prepare a concise summary report."
+        score_cases = [
+            (0, {"reasoning_depth": 0, "code_change_scope": 0, "ambiguity": 0, "risk": 0}, r.FLASH),
+            (1, {"reasoning_depth": 1, "code_change_scope": 0, "ambiguity": 0, "risk": 0}, r.FLASH),
+            (2, {"reasoning_depth": 1, "code_change_scope": 1, "ambiguity": 0, "risk": 0}, r.FLASH),
+            (3, {"reasoning_depth": 1, "code_change_scope": 1, "ambiguity": 1, "risk": 0}, r.FLASH),
+            (4, {"reasoning_depth": 1, "code_change_scope": 1, "ambiguity": 1, "risk": 1}, r.FLASH),
+            (5, {"reasoning_depth": 2, "code_change_scope": 1, "ambiguity": 1, "risk": 1}, r.PRO),
+            (6, {"reasoning_depth": 2, "code_change_scope": 2, "ambiguity": 1, "risk": 1}, r.PRO),
+            (7, {"reasoning_depth": 3, "code_change_scope": 2, "ambiguity": 1, "risk": 1}, r.PRO),
+            (8, {"reasoning_depth": 3, "code_change_scope": 3, "ambiguity": 1, "risk": 1}, r.PRO),
+            (9, {"reasoning_depth": 3, "code_change_scope": 3, "ambiguity": 2, "risk": 1}, r.PRO),
+            (10, {"reasoning_depth": 3, "code_change_scope": 3, "ambiguity": 2, "risk": 2}, r.PRO),
+        ]
+
+        self.assertTrue(r.is_summary_like_subtask(desc))
+        self.assertFalse(r.has_deep_work_hint(desc))
+        self.assertFalse(r.has_data_gathering_hint(desc))
+
+        for expected_score, score_parts, expected_route in score_cases:
+            scores = {**score_parts, "io_heaviness": 2}
+            with self.subTest(complexity_score=expected_score):
+                self.assertEqual(r.score_complexity(scores), expected_score)
+                self.assertEqual(
+                    r.decide_route(task, desc, scores, r.FLASH, 0.9),
+                    expected_route,
+                )
+
+    def test_database_ingestion_with_summary_field_keeps_pro_score_routes(self):
+        task = "Collect news and store it in the my_rag database."
+        desc = (
+            "Discover the my_rag database connection method, then ingest all 20 news "
+            "records with metadata (headline, source, URL, summary, timestamp)."
+        )
+        score_cases = [
+            (5, {"reasoning_depth": 2, "code_change_scope": 1, "ambiguity": 1, "risk": 1}),
+            (6, {"reasoning_depth": 2, "code_change_scope": 1, "ambiguity": 1, "risk": 2}),
+            (7, {"reasoning_depth": 2, "code_change_scope": 2, "ambiguity": 1, "risk": 2}),
+            (8, {"reasoning_depth": 3, "code_change_scope": 2, "ambiguity": 1, "risk": 2}),
+            (9, {"reasoning_depth": 3, "code_change_scope": 3, "ambiguity": 1, "risk": 2}),
+            (10, {"reasoning_depth": 3, "code_change_scope": 3, "ambiguity": 2, "risk": 2}),
+        ]
+
+        self.assertTrue(r.is_summary_like_subtask(desc))
+        self.assertTrue(r.has_data_gathering_hint(desc))
+
+        for expected_score, score_parts in score_cases:
+            scores = {**score_parts, "io_heaviness": 2}
+            raw_judgment = {
+                "scores": scores,
+                "suggested_route": r.PRO,
+                "confidence": 0.9,
+                "reason": "Requires environment discovery and persistent database writes.",
+            }
+
+            with self.subTest(complexity_score=expected_score):
+                self.assertEqual(r.score_complexity(scores), expected_score)
+                self.assertEqual(r.decide_route(task, desc, scores, r.PRO, 0.9), r.PRO)
+
+                assessment = r.normalize_complexity_assessment(raw_judgment, task, desc)
+                self.assertEqual(assessment["complexity_score"], expected_score)
+                self.assertEqual(assessment["final_route"], r.PRO)
+                self.assertEqual(assessment["judge_source"], "structured_llm")
+
     def test_final_synthesis_routes_to_pro_despite_flash_judge_suggestion(self):
         task = "Analyze provider A and provider B, then synthesize the final report."
         desc = "Synthesize the final report from all provider findings and prior results."
