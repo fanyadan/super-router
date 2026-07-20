@@ -1714,6 +1714,48 @@ class FinalizerTests(unittest.TestCase):
         )
         self.assertFalse(r.has_distinct_finalizer_model_path(same_state))
 
+    def _step_result(self, step, subtask_id, route, model_name):
+        return {
+            "step": step,
+            "subtask_id": subtask_id,
+            "depends_on": [],
+            "planned_route": route,
+            "route": route,
+            "model_name": model_name,
+            "desc": f"desc {subtask_id}",
+            "output": "output",
+            "status": "success",
+            "attempt_count": 1,
+            "retry_count": 0,
+            "escalated_from_flash": False,
+            "used_provider_fallback": False,
+            "flash_review": r.empty_flash_review(),
+            "attempt_log": [],
+        }
+
+    def test_routing_table_uses_verbatim_model_names(self):
+        state = r.create_initial_state(
+            "news",
+            pro_model="claude/claude-opus-4-8",
+            flash_model="google-gemini-cli/gemini-3-flash-preview",
+        )
+        # append out of order to confirm the table sorts by step
+        state["results"] = [
+            self._step_result(3, "S3", "PRO", "claude/claude-opus-4-8"),
+            self._step_result(1, "S1", "FLASH", "google-gemini-cli/gemini-3-flash-preview"),
+        ]
+        table = r.build_routing_table(state)
+        # exact IDs copied verbatim; no paraphrased/hallucinated product name
+        self.assertIn("claude/claude-opus-4-8", table)
+        self.assertIn("google-gemini-cli/gemini-3-flash-preview", table)
+        self.assertNotIn("Claude 3 Opus", table)
+        # sorted by step: S1 row precedes S3 row
+        self.assertLess(table.index("| 1 | S1 |"), table.index("| 3 | S3 |"))
+
+    def test_routing_table_empty_when_no_results(self):
+        state = r.create_initial_state("empty")
+        self.assertEqual(r.build_routing_table(state), "")
+
 
 class RouterGraphIntegrationTests(unittest.TestCase):
     def fake_generate_success(self, model, prompt, **kwargs):

@@ -85,7 +85,8 @@ def build_fallback_report(state: RouterState, finalizer_error: str = "") -> str:
             detail_bits.append(f"failure={flash_review['failure_type']}")
         detail_suffix = f" ({', '.join(detail_bits)})" if detail_bits else ""
         lines.append(
-            f"  {result['step']}. [{result['route']}] {result['desc']}{detail_suffix} -> "
+            f"  {result['step']}. [{result['route']}:{result['model_name']}] "
+            f"{result['desc']}{detail_suffix} -> "
             f"{compact_text(result['output'], 140)}"
         )
         if flash_review["reason"]:
@@ -105,6 +106,29 @@ def build_fallback_report(state: RouterState, finalizer_error: str = "") -> str:
         )
         if finalizer_outcome["reason"]:
             lines.append(f"  - reason: {finalizer_outcome['reason']}")
+    return "\n".join(lines)
+
+
+def build_routing_table(state: RouterState) -> str:
+    """Deterministic per-step routing table.
+
+    Model names are copied verbatim from each step's recorded ``model_name`` so the
+    routing summary always reflects the exact model that was invoked (e.g.
+    ``claude/claude-opus-4-8``) instead of a name paraphrased by the finalizer LLM.
+    """
+    results = sorted(state["results"], key=lambda item: item["step"])
+    if not results:
+        return ""
+    lines = [
+        "路由明细 / Routing detail (models copied verbatim as invoked)",
+        "| Step | Subtask | Route | Model |",
+        "| --- | --- | --- | --- |",
+    ]
+    for result in results:
+        lines.append(
+            f"| {result['step']} | {result['subtask_id']} | "
+            f"{result['route']} | {result['model_name']} |"
+        )
     return "\n".join(lines)
 
 
@@ -369,8 +393,12 @@ def finalizer_complete_node(state: RouterState) -> RouterState:
     token_usage = get_token_usage_records(state["run_id"])
     token_usage_summary = summarize_token_usage_records(token_usage)
     token_usage_history: List[str] = ["Finalizer completed."]
+    routing_table = build_routing_table(state)
+    final_report = state["final_report"]
+    if routing_table:
+        final_report = f"{final_report}\n\n{routing_table}"
     print("\n" + "=" * 58)
-    print(state["final_report"])
+    print(final_report)
     print("-" * 58)
     print(format_token_usage_summary(token_usage_summary))
     try:
@@ -392,5 +420,6 @@ def finalizer_complete_node(state: RouterState) -> RouterState:
         "history": token_usage_history,
         "token_usage": token_usage,
         "token_usage_summary": token_usage_summary,
+        "final_report": final_report,
         "status": "finished",
     }
