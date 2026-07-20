@@ -334,7 +334,7 @@ class RouterHelperTests(unittest.TestCase):
             os.environ,
             {r.ROUTER_PLANNER_MAX_OUTPUT_TOKENS_ENV_VAR: "123"},
             clear=False,
-        ), mock.patch.object(r, "generate_text", side_effect=fake_generate_text):
+        ), mock.patch.object(r.generation, "generate_text", side_effect=fake_generate_text):
             result, _ = run_quietly(r.planner_invoke_node, state)
 
         self.assertEqual(result["planner_raw_text"], "[{\"desc\":\"Inspect planner output cap\"}]")
@@ -688,7 +688,7 @@ class RouterHelperTests(unittest.TestCase):
             captured.append((model, prompt, timeout, temperature))
             return r.build_text_generation_result("ok", {}, "google_genai", model)
 
-        with mock.patch.object(r, "gemini_generate_with_usage", side_effect=fake_gemini):
+        with mock.patch.object(r.provider_gemini, "gemini_generate_with_usage", side_effect=fake_gemini):
             self.assertEqual(
                 r.generate_text("google-gemini-cli/flash", "prompt", timeout=30, temperature=0.2),
                 "ok",
@@ -703,7 +703,7 @@ class RouterHelperTests(unittest.TestCase):
             captured.append((model, prompt, timeout, num_predict, temperature))
             return r.build_text_generation_result("ok", {}, "codex", r.normalize_model_name(model))
 
-        with mock.patch.object(r, "codex_generate_with_usage", side_effect=fake_codex):
+        with mock.patch.object(r.provider_codex, "codex_generate_with_usage", side_effect=fake_codex):
             self.assertEqual(
                 r.generate_text("codex/gpt-5.5", "prompt", timeout=30, num_predict=99, temperature=0.2),
                 "ok",
@@ -718,7 +718,7 @@ class RouterHelperTests(unittest.TestCase):
             captured.append((model, prompt, timeout, temperature))
             return r.build_text_generation_result("ok", {}, "anthropic", r.normalize_model_name(model))
 
-        with mock.patch.object(r, "claude_generate_with_usage", side_effect=fake_claude):
+        with mock.patch.object(r.provider_claude, "claude_generate_with_usage", side_effect=fake_claude):
             self.assertEqual(
                 r.generate_text("claude/sonnet", "prompt", timeout=30, temperature=0.2),
                 "ok",
@@ -761,10 +761,10 @@ class RouterHelperTests(unittest.TestCase):
             return FakeResult()
 
         with (
-            mock.patch.object(r, "GEMINI_CLI_PATH", "/tmp/gemini"),
+            mock.patch.object(r.config, "GEMINI_CLI_PATH", "/tmp/gemini"),
             mock.patch.object(r.os.path, "exists", return_value=True),
             mock.patch.dict(os.environ, {r.GEMINI_SYSTEM_SETTINGS_ENV_VAR: ""}, clear=False),
-            mock.patch.object(r, "run_provider_cli", side_effect=fake_cli),
+            mock.patch.object(r.provider_process, "run_provider_cli", side_effect=fake_cli),
         ):
             result = r.invoke_gemini_cli_with_usage(
                 "google-gemini-cli/gemini-3-pro-preview",
@@ -815,9 +815,9 @@ class RouterHelperTests(unittest.TestCase):
 
         with (
             mock.patch.dict(os.environ, {"ROUTER_CLAUDE_SANDBOX": "", "ROUTER_CLAUDE_CWD": ""}, clear=False),
-            mock.patch.object(r, "CLAUDE_CLI_PATH", "/tmp/claude"),
+            mock.patch.object(r.config, "CLAUDE_CLI_PATH", "/tmp/claude"),
             mock.patch.object(r.os.path, "exists", return_value=True),
-            mock.patch.object(r, "run_provider_cli", side_effect=fake_cli),
+            mock.patch.object(r.provider_process, "run_provider_cli", side_effect=fake_cli),
         ):
             result = r.claude_generate_with_usage(
                 "claude/sonnet",
@@ -868,9 +868,9 @@ class RouterHelperTests(unittest.TestCase):
                 },
                 clear=False,
             ),
-            mock.patch.object(r, "CLAUDE_CLI_PATH", "/tmp/claude"),
+            mock.patch.object(r.config, "CLAUDE_CLI_PATH", "/tmp/claude"),
             mock.patch.object(r.os.path, "exists", return_value=True),
-            mock.patch.object(r, "run_provider_cli", side_effect=fake_cli),
+            mock.patch.object(r.provider_process, "run_provider_cli", side_effect=fake_cli),
         ):
             r.claude_generate_with_usage("claude/sonnet", "prompt", timeout=30)
 
@@ -1053,9 +1053,9 @@ class RouterHelperTests(unittest.TestCase):
                 },
                 clear=False,
             ),
-            mock.patch.object(r, "CODEX_CLI_PATH", "/tmp/codex"),
+            mock.patch.object(r.config, "CODEX_CLI_PATH", "/tmp/codex"),
             mock.patch.object(r.os.path, "exists", return_value=True),
-            mock.patch.object(r, "run_provider_cli", side_effect=fake_cli),
+            mock.patch.object(r.provider_process, "run_provider_cli", side_effect=fake_cli),
         ):
             result = r.codex_generate_with_usage(
                 "codex/gpt-5.5",
@@ -1143,8 +1143,8 @@ class RouterHelperTests(unittest.TestCase):
             return r.build_text_generation_result("ok", {}, "test", model, "unavailable")
 
         with r.router_run_deadline_context(5):
-            with mock.patch.object(r, "langsmith_tracing_configured", return_value=False):
-                with mock.patch.object(r, "_execute_generate_text_with_usage", side_effect=fake_generate):
+            with mock.patch.object(r.langsmith_integration, "langsmith_tracing_configured", return_value=False):
+                with mock.patch.object(r.generation, "_execute_generate_text_with_usage", side_effect=fake_generate):
                     self.assertEqual(
                         r.generate_text("ollama/test", "prompt", timeout=300, usage_label="deadline"),
                         "ok",
@@ -1254,7 +1254,7 @@ class RouterHelperTests(unittest.TestCase):
 
         with (
             mock.patch.dict(os.environ, {"ROUTER_EXECUTOR_TIMEOUT": "19"}, clear=False),
-            mock.patch.object(r, "invoke_with_provider_fallback", side_effect=fake_invoke),
+            mock.patch.object(r.model_invocation, "invoke_with_provider_fallback", side_effect=fake_invoke),
         ):
             r.invoke_parallel_executor_attempt(
                 state,
@@ -1281,7 +1281,7 @@ class RouterHelperTests(unittest.TestCase):
             )
 
         with r.token_usage_tracking_context("test-token-run"):
-            with mock.patch.object(r, "gemini_generate_with_usage", side_effect=fake_gemini):
+            with mock.patch.object(r.provider_gemini, "gemini_generate_with_usage", side_effect=fake_gemini):
                 self.assertEqual(
                     r.generate_text(
                         "google-gemini-cli/gemini-3-pro-preview",
@@ -1375,7 +1375,7 @@ class ProviderFallbackTests(unittest.TestCase):
                 raise RuntimeError("connection reset by provider")
             return "fallback success"
 
-        with mock.patch.object(r, "generate_text", side_effect=fake_generate):
+        with mock.patch.object(r.generation, "generate_text", side_effect=fake_generate):
             result = r.invoke_with_provider_fallback(
                 "primary",
                 ["fallback"],
@@ -1398,7 +1398,7 @@ class ProviderFallbackTests(unittest.TestCase):
             calls.append(model)
             raise RuntimeError("need more context to complete")
 
-        with mock.patch.object(r, "generate_text", side_effect=fake_generate):
+        with mock.patch.object(r.generation, "generate_text", side_effect=fake_generate):
             result = r.invoke_with_provider_fallback(
                 "primary",
                 ["fallback"],
@@ -1422,7 +1422,7 @@ class ProviderFallbackTests(unittest.TestCase):
 
         with (
             mock.patch.dict(os.environ, {"ROUTER_MAX_PROVIDER_ATTEMPTS": "2"}, clear=False),
-            mock.patch.object(r, "generate_text", side_effect=fake_generate),
+            mock.patch.object(r.generation, "generate_text", side_effect=fake_generate),
         ):
             result = r.invoke_with_provider_fallback(
                 "primary",
@@ -1536,7 +1536,7 @@ class FlashReviewAndMetadataTests(unittest.TestCase):
                 "attempt_log": list(attempt_log or []),
             }
 
-        with mock.patch.object(r, "invoke_with_provider_fallback", side_effect=fake_invoke):
+        with mock.patch.object(r.model_invocation, "invoke_with_provider_fallback", side_effect=fake_invoke):
             (result, errors), output = run_quietly(
                 r.execute_subtask_in_parallel_branch,
                 state,
@@ -1591,7 +1591,7 @@ class FlashReviewAndMetadataTests(unittest.TestCase):
                 "attempt_log": list(attempt_log or []),
             }
 
-        with mock.patch.object(r, "invoke_with_provider_fallback", side_effect=fake_invoke):
+        with mock.patch.object(r.model_invocation, "invoke_with_provider_fallback", side_effect=fake_invoke):
             (result, errors), _ = run_quietly(
                 r.execute_subtask_in_parallel_branch,
                 state,
@@ -1638,7 +1638,7 @@ class FlashReviewAndMetadataTests(unittest.TestCase):
                 "attempt_log": [],
             }
 
-        with mock.patch.object(r, "invoke_with_provider_fallback", side_effect=fake_invoke):
+        with mock.patch.object(r.model_invocation, "invoke_with_provider_fallback", side_effect=fake_invoke):
             update, _ = run_quietly(r.extract_technical_metadata_node, state)
 
         self.assertIn("TECHNICAL METADATA STEP 1", update["history"][0])
@@ -1664,7 +1664,7 @@ class FlashReviewAndMetadataTests(unittest.TestCase):
             }
         ]
 
-        with mock.patch.object(r, "invoke_with_provider_fallback") as invoke_mock:
+        with mock.patch.object(r.model_invocation, "invoke_with_provider_fallback") as invoke_mock:
             update, _ = run_quietly(r.extract_technical_metadata_node, state)
 
         invoke_mock.assert_not_called()
@@ -1693,7 +1693,7 @@ class FinalizerTests(unittest.TestCase):
 
         state = r.create_initial_state("timeout", pro_model="pro", flash_model="flash")
         with mock.patch.dict(os.environ, {"ROUTER_FINALIZER_TIMEOUT": "17"}, clear=False):
-            with mock.patch.object(r, "invoke_with_provider_fallback", side_effect=fake_invoke):
+            with mock.patch.object(r.model_invocation, "invoke_with_provider_fallback", side_effect=fake_invoke):
                 r.flash_finalizer_node(state)
                 r.pro_finalizer_node(state)
 
@@ -1759,7 +1759,7 @@ class RouterGraphIntegrationTests(unittest.TestCase):
 
     def test_full_graph_success_path_with_metadata_and_no_debug_output(self):
         with mock.patch.dict(os.environ, {"ROUTER_DEBUG": ""}, clear=False):
-            with mock.patch.object(r, "generate_text", side_effect=self.fake_generate_success):
+            with mock.patch.object(r.generation, "generate_text", side_effect=self.fake_generate_success):
                 state, output = run_quietly(
                     r.run_router_app,
                     "Inspect router state flow and summarize",
@@ -1811,7 +1811,7 @@ class RouterGraphIntegrationTests(unittest.TestCase):
                 )
             return "Fallback mocked output with sufficient detail."
 
-        with mock.patch.object(r, "generate_text", side_effect=fake_generate):
+        with mock.patch.object(r.generation, "generate_text", side_effect=fake_generate):
             state, _ = run_quietly(
                 r.run_router_app,
                 "List deployment manifests",
@@ -1873,7 +1873,7 @@ class RouterGraphIntegrationTests(unittest.TestCase):
                 )
             return "Fallback mocked output with sufficient detail."
 
-        with mock.patch.object(r, "generate_text", side_effect=fake_generate):
+        with mock.patch.object(r.generation, "generate_text", side_effect=fake_generate):
             state, _ = run_quietly(
                 r.run_router_app,
                 "Analyze provider A and provider B independently",
@@ -1950,7 +1950,7 @@ class RouterGraphIntegrationTests(unittest.TestCase):
                 )
             return "Fallback mocked output with sufficient detail."
 
-        with mock.patch.object(r, "generate_text", side_effect=fake_generate):
+        with mock.patch.object(r.generation, "generate_text", side_effect=fake_generate):
             state, _ = run_quietly(
                 r.run_router_app,
                 "Analyze provider A and provider B, then compare them",
@@ -1969,7 +1969,7 @@ class RouterGraphIntegrationTests(unittest.TestCase):
         self.assertEqual(len(compare_prompts), 1)
 
     def test_streamed_graph_returns_final_state(self):
-        with mock.patch.object(r, "generate_text", side_effect=self.fake_generate_success):
+        with mock.patch.object(r.generation, "generate_text", side_effect=self.fake_generate_success):
             state, _ = run_quietly(
                 r.run_router_app,
                 "Inspect router state flow and summarize",

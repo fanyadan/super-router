@@ -47,7 +47,8 @@ tracing, and token usage accounting.
 |-- references/
 |-- scripts/
 |   |-- render_super_router_diagram.py
-|   `-- router.py
+|   |-- router.py            # thin entry-point shim (CLI + import surface)
+|   `-- routerlib/           # implementation package (config, providers, nodes, graph, app, ...)
 |-- templates/
 `-- tests/
     |-- __init__.py
@@ -57,7 +58,8 @@ tracing, and token usage accounting.
 | Path | Purpose |
 | --- | --- |
 | `SKILL.md` | Hermes skill metadata and agent-facing usage contract. |
-| `scripts/router.py` | Main LangGraph router, provider dispatch, fallback logic, telemetry, token accounting, and CLI. |
+| `scripts/router.py` | Thin entry-point shim: keeps the `python scripts/router.py` CLI and `import scripts.router` surface; re-exports the `routerlib` package. |
+| `scripts/routerlib/` | Implementation package: LangGraph router, provider dispatch, fallback logic, telemetry, token accounting, and CLI, split by domain (`config`, `providers_*`, `nodes_*`, `graph`, `app`, ...). |
 | `scripts/render_super_router_diagram.py` | Deterministic diagram renderer; verifies the diagram node set against `build_router_graph()`. |
 | `super-router.png` | Current architecture diagram used by this README. |
 | `tests/test_router.py` | Offline regression tests using `unittest` and mocks. |
@@ -153,7 +155,8 @@ python -m unittest tests/test_router.py
 
 ## Current Architecture
 
-The main graph is built by `build_router_graph()` in `scripts/router.py`.
+The main graph is built by `build_router_graph()` in `scripts/routerlib/graph.py`
+(re-exported as `scripts.router.build_router_graph`).
 
 ```text
 START

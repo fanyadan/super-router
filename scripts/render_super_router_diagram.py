@@ -2,8 +2,8 @@
 """Render the Super Router LangGraph architecture diagram.
 
 This is a deterministic source for the root-level ``super-router.png`` asset.
-It reads ``scripts/router.py`` to verify that the diagram still covers the
-current ``build_router_graph`` node set before writing the image.
+It reads ``scripts/routerlib/graph.py`` to verify that the diagram still covers
+the current ``build_router_graph`` node set before writing the image.
 """
 
 from __future__ import annotations
@@ -17,7 +17,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ROUTER_PATH = ROOT / "scripts" / "router.py"
+# ``build_router_graph`` lives in the routerlib package after the router split.
+ROUTER_PATH = ROOT / "scripts" / "routerlib" / "graph.py"
 OUTPUT_PATH = ROOT / "super-router.png"
 
 WIDTH = 1861
